@@ -1,36 +1,50 @@
+CREATE TABLE accounts (
+    UserID          BIGINT PRIMARY KEY COMMENT 'Telegram User ID (64-bit)',
+    FirstName       VARCHAR(50),
+    LastName        VARCHAR(50),
+    Username        VARCHAR(50),
+    CurrentBalance  DECIMAL(10,2) DEFAULT 0.00,
+    CreatedAt       DATETIME DEFAULT CURRENT_TIMESTAMP,
+    -- Add if needed later:
+    -- MaxDevices      TINYINT UNSIGNED DEFAULT 1 COMMENT 'max active peers allowed'
+);
+
 CREATE TABLE wireguard_peers (
     PeerID          INT AUTO_INCREMENT PRIMARY KEY,
 
-    UserID          BIGINT NOT NULL COMMENT 'Telegram user ID — globally unique identifier from Bot API',
+    UserID          BIGINT NOT NULL COMMENT 'Telegram user ID — links to accounts',
 
-    ServerName      VARCHAR(100) NOT NULL COMMENT 'friendly server identifier, e.g. "Tokyo-1", "Frankfurt-HighSpeed"',
+    PurchaseGroup   SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+    DeviceSeq       TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    DisplaySlot     VARCHAR(16) GENERATED ALWAYS AS (CONCAT(DeviceSeq, '-', PurchaseGroup)) STORED 
+        COMMENT 'e.g. "1-2", "2-2", "1-3"',
 
-    Name            VARCHAR(80) NOT NULL DEFAULT '' COMMENT 'custom/friendly name, e.g. "iPhone 15", "Work Laptop - Dubai", "Trial User #42"',
+    ServerName      VARCHAR(100) NOT NULL,
+    Name            VARCHAR(80) NOT NULL DEFAULT '',
 
-    PublicKey       CHAR(44) NOT NULL UNIQUE COMMENT 'peer public key (server-side view)',
-    PrivateKey      CHAR(44) NOT NULL COMMENT 'peer private key (delivered to client in config)',
-    PresharedKey    CHAR(44) DEFAULT NULL COMMENT 'optional pre-shared key',
+    PublicKey       CHAR(44) NOT NULL UNIQUE,
+    PrivateKey      CHAR(44) NOT NULL,
+    PresharedKey    CHAR(44) DEFAULT NULL,
 
-    AllowedIPs      VARCHAR(512) NOT NULL COMMENT 'comma-separated, e.g. "10.55.0.5/32, fd42::5/128"',
+    AllowedIPs      VARCHAR(512) NOT NULL,
 
     DataLimitBytes  BIGINT DEFAULT NULL COMMENT 'NULL = unlimited',
-    RxBytes         BIGINT NOT NULL DEFAULT 0 COMMENT 'bytes received by peer (download from server perspective)',
-    TxBytes         BIGINT NOT NULL DEFAULT 0 COMMENT 'bytes sent by peer (upload from server perspective)',
+    RxBytes         BIGINT NOT NULL DEFAULT 0,
+    TxBytes         BIGINT NOT NULL DEFAULT 0,
 
     IssuedAt        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    ValidDays       SMALLINT NOT NULL DEFAULT 30 COMMENT 'validity period in days',
+    ValidDays       SMALLINT NOT NULL DEFAULT 30,
 
     IsActive        BOOLEAN NOT NULL DEFAULT TRUE,
-    DeactivatedAt   DATETIME DEFAULT NULL COMMENT 'timestamp when access was revoked',
+    DeactivatedAt   DATETIME DEFAULT NULL,
 
-    LastHandshakeAt DATETIME DEFAULT NULL COMMENT 'last successful handshake (from wg show)',
+    LastHandshakeAt DATETIME DEFAULT NULL,
     HandshakeStatus TINYINT NOT NULL DEFAULT 0 
         COMMENT '0=never connected, 1=definitely online, 2=probably online, 3=offline',
 
     FOREIGN KEY (UserID) REFERENCES accounts(UserID) ON DELETE CASCADE,
 
-    -- Recommended indexes
+    UNIQUE KEY uk_user_group_seq (UserID, PurchaseGroup, DeviceSeq),
     INDEX idx_user_active (UserID, IsActive),
-    INDEX idx_pubkey (PublicKey)  -- redundant with UNIQUE but explicit
-    -- Optional: INDEX idx_status (IsActive, HandshakeStatus, ValidDays)
+    INDEX idx_pubkey (PublicKey)
 );
