@@ -6,10 +6,11 @@ CREATE TABLE wireguard_peers (
 
     Name            VARCHAR(80) NOT NULL DEFAULT '' COMMENT 'custom/friendly name, e.g. "iPhone 15", "Work Laptop - Dubai", "Trial User #42"',
 
-    PublicKey       CHAR(44) NOT NULL UNIQUE,           -- base64, fixed 44 chars
-    PresharedKey    CHAR(44) DEFAULT NULL,
+    PublicKey       CHAR(44) NOT NULL UNIQUE,           -- server's view: this peer's public key
+    PrivateKey      CHAR(44) NOT NULL,                  -- client's private key (for generating full config) — usually NOT NULL
+    PresharedKey    CHAR(44) DEFAULT NULL,              -- optional PSK
 
-    AllowedIPs      VARCHAR(512) NOT NULL,              -- increased for multiple IPs/IPv6
+    AllowedIPs      VARCHAR(512) NOT NULL,              -- "10.55.0.5/32, fd42::5/128" etc.
 
     DataLimitBytes  BIGINT DEFAULT NULL COMMENT 'NULL = unlimited',
     RxBytes         BIGINT NOT NULL DEFAULT 0 COMMENT 'bytes received by the peer (download from server view)',
