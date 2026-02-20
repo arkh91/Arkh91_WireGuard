@@ -423,18 +423,20 @@ show_menu() {
 # ────────────────────────────────────────────────
 
 check_root
-parse_args "$@"
+show_menu
 
-if [ -n "$ACTION" ]; then
-    if [ "$ACTION" = "uninstall" ]; then
-        uninstall
-    else
-        install
-    fi
-    exit 0
-fi
+#parse_args "$@"
+
+#if [ -n "$ACTION" ]; then
+#    if [ "$ACTION" = "uninstall" ]; then
+#        uninstall
+#    else
+#        install
+#    fi
+#    exit 0
+#fi
 
 # Interactive mode
-while true; do
-    show_menu
-done
+#while true; do
+#    show_menu
+#done
