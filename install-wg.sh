@@ -1,34 +1,34 @@
 #!/bin/bash
-# WireGuard + Secure Hidden API Installer / Manager (Production-ready with HTTPS)
-# Ubuntu/Debian - menu + CLI + Caddy HTTPS + Bearer token auth
+# WireGuard + Secure HTTPS API Installer / Manager (Production-ready, modular)
+# Ubuntu/Debian - menu + CLI + Caddy + Bearer token
 
 set -e
 
 # ────────────────────────────────────────────────
-# Defaults
+# Configuration / Globals
 # ────────────────────────────────────────────────
 WG_INTERFACE="wg0"
 WG_PORT=51820
 WG_NETWORK="10.66.66.0/24"
-API_PORT_INTERNAL=3001           # Node listens here (localhost only)
+API_PORT_INTERNAL=3001           # Node.js localhost port
 API_DIR="/opt/wg-api"
 API_SERVICE="wg-api.service"
 WG_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
 OUT_IFACE=""
-CADDY_PORT=443                   # public HTTPS port
-DOMAIN=""                        # will ask during install
+DOMAIN=""
+CADDY_PORT=443
 
 # ────────────────────────────────────────────────
-# Parse CLI args
+# CLI Argument Parsing
 # ────────────────────────────────────────────────
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --port=*) WG_PORT="${1#*=}" ; shift ;;
-            --api-port=*) API_PORT_INTERNAL="${1#*=}" ; shift ;;
+            --port=*)           WG_PORT="${1#*=}" ; shift ;;
+            --api-port=*)       API_PORT_INTERNAL="${1#*=}" ; shift ;;
             --uninstall|-u|--remove) ACTION="uninstall" ; shift ;;
-            --help|-h) show_help ; exit 0 ;;
-            *) echo "Unknown option: $1" ; echo "Use --help" ; exit 1 ;;
+            --help|-h)          show_help ; exit 0 ;;
+            *) echo "Unknown: $1" ; echo "Use --help" ; exit 1 ;;
         esac
     done
 }
@@ -37,67 +37,59 @@ show_help() {
     cat <<EOF
 Usage: sudo $0 [options]
 
-Options (non-interactive):
-  --port=51830              WireGuard UDP port
-  --api-port=8080           Internal API port (Node.js)
-  --uninstall               Uninstall
-  --help                    This help
+Options:
+  --port=51830          WireGuard UDP port
+  --api-port=4000       Internal Node.js port (localhost)
+  --uninstall           Remove setup
+  --help                This message
 
-Without args → interactive menu
-
-Examples:
-  sudo $0
-  sudo $0 --port=51830
-  sudo $0 --uninstall
+No args → interactive menu
 EOF
 }
 
 # ────────────────────────────────────────────────
-# Helpers
+# Utility Helpers
 # ────────────────────────────────────────────────
 
 check_root() {
-    [ "$EUID" -ne 0 ] && { echo "Run as root."; exit 1; }
+    [ "$EUID" -ne 0 ] && { echo "Must run as root."; exit 1; }
 }
 
 detect_out_iface() {
-    OUT_IFACE=$(ip -4 route show default | awk '{print $5; exit}')
-    [ -z "$OUT_IFACE" ] && OUT_IFACE="eth0"
-    echo "Outbound interface: $OUT_IFACE"
+    OUT_IFACE=$(ip -4 route show default | awk '{print $5; exit}' || echo "eth0")
+    echo "→ Outbound interface: $OUT_IFACE"
 }
 
-ask_domain() {
+ask_for_domain() {
     echo ""
-    echo "For production HTTPS you NEED a domain (e.g. api.vpn.yourdomain.com)"
-    echo "Point A record to this server's public IP."
+    echo "HTTPS requires a domain (e.g. api.vpn.yourdomain.com)"
+    echo "Make sure A record points to this server's public IP."
     echo ""
-    read -rp "Enter your domain for the API: " DOMAIN
-    if [[ -z "$DOMAIN" ]]; then
-        echo "Domain is required for secure install. Aborting."
-        exit 1
-    fi
+    read -rp "Domain: " DOMAIN
+    [[ -z "$DOMAIN" ]] && { echo "Domain required. Aborting."; exit 1; }
 }
 
-install() {
-    check_root
-    detect_out_iface
+# ────────────────────────────────────────────────
+# Installation Steps (Modular Functions)
+# ────────────────────────────────────────────────
 
-    if [[ -z "$DOMAIN" ]]; then
-        ask_domain
-    fi
-
-    echo "Installing packages (WireGuard + Node + Caddy)..."
+install_packages() {
+    echo "→ Updating package list and installing dependencies..."
     apt update -y
     apt install -y wireguard iptables iptables-persistent nodejs npm curl openssl
+}
 
-    # Install Caddy (official repo method 2025+)
+install_caddy() {
+    echo "→ Installing Caddy (automatic HTTPS)..."
     install -m 0755 -d /etc/apt/keyrings
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
     apt update -y
     apt install -y caddy
+}
 
-    # WireGuard server setup (same as before)
+setup_wireguard_keys_and_config() {
+    echo "→ Generating WireGuard server keys and config..."
     SERVER_PRIVATE_KEY=$(wg genkey)
     SERVER_PUBLIC_KEY=$(echo "$SERVER_PRIVATE_KEY" | wg pubkey)
 
@@ -110,33 +102,51 @@ PrivateKey = $SERVER_PRIVATE_KEY
 SaveConfig = true
 EOF
     chmod 600 "$WG_CONFIG"
+}
 
+enable_ip_forwarding() {
+    echo "→ Enabling IP forwarding..."
     sysctl -w net.ipv4.ip_forward=1
     sed -i 's/^#\{0,1\}net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+}
 
+setup_firewall_rules() {
+    echo "→ Configuring iptables rules..."
     iptables -A INPUT -p udp --dport "$WG_PORT" -j ACCEPT
     iptables -A FORWARD -i "$WG_INTERFACE" -j ACCEPT
     iptables -A FORWARD -o "$WG_INTERFACE" -j ACCEPT
     iptables -t nat -A POSTROUTING -s "$WG_NETWORK" -o "$OUT_IFACE" -j MASQUERADE
     netfilter-persistent save
+}
 
+start_wireguard() {
+    echo "→ Enabling and starting WireGuard..."
     systemctl enable --now wg-quick@"$WG_INTERFACE"
+}
 
-    # ─── Secure API ───
-    echo "Setting up secure API (localhost only + Bearer auth)..."
-
-    # Create non-root user
+create_api_user() {
+    echo "→ Creating non-root API user (wgapi)..."
     id wgapi 2>/dev/null || useradd -r -s /usr/sbin/nologin wgapi
+}
 
+setup_api_directory_and_npm() {
+    echo "→ Setting up API directory and installing npm packages..."
     mkdir -p "$API_DIR"
     chown wgapi:wgapi "$API_DIR"
-    cd "$API_DIR"
+    cd "$API_DIR" || exit 1
 
     npm init -y >/dev/null 2>&1
     npm install express express-rate-limit helmet >/dev/null 2>&1
+}
 
+generate_api_token() {
+    API_TOKEN=$(openssl rand -hex 32)
+    echo "→ Generated API Bearer token: $API_TOKEN"
+}
+
+write_api_server_js() {
+    echo "→ Writing secure Node.js API server (localhost only)..."
     SERVER_IP=$(curl -s ifconfig.me || echo "your-public-ip")
-    API_TOKEN=$(openssl rand -hex 32)   # Strong Bearer token
 
     cat > server.js <<EOF
 const express = require('express');
@@ -144,25 +154,24 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const { execSync } = require('child_process');
 const fs = require('fs');
-const app = express();
 
+const app = express();
 app.use(helmet());
 app.use(express.json());
 
-// Rate limit: 60 req / 15 min per IP
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+// Rate limiting
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
   max: 60,
-  message: { error: 'Too many requests, try again later.' }
-});
-app.use(limiter);
+  message: { error: 'Too many requests' }
+}));
 
-// Bearer token auth
+// Bearer token authentication
 const API_TOKEN = '$API_TOKEN';
 app.use((req, res, next) => {
   const auth = req.headers.authorization;
   if (!auth || auth !== \`Bearer \${API_TOKEN}\`) {
-    return res.status(401).json({ error: 'Unauthorized - invalid or missing token' });
+    return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
 });
@@ -228,13 +237,15 @@ app.post('/remove', (req, res) => {
 });
 
 app.listen($API_PORT_INTERNAL, '127.0.0.1', () => {
-  console.log('Secure API running on localhost:$API_PORT_INTERNAL');
+  console.log('API running on localhost:$API_PORT_INTERNAL');
 });
 EOF
 
     chown -R wgapi:wgapi "$API_DIR"
+}
 
-    # Systemd service (non-root)
+create_api_systemd_service() {
+    echo "→ Creating systemd service for API (non-root)..."
     cat > "/etc/systemd/system/$API_SERVICE" <<EOF
 [Unit]
 Description=WireGuard Secure API
@@ -253,18 +264,18 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now "$API_SERVICE"
+}
 
-    # ─── Caddy reverse proxy + automatic HTTPS ───
+configure_caddy() {
+    echo "→ Configuring Caddy reverse proxy + automatic HTTPS..."
     cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
     reverse_proxy 127.0.0.1:$API_PORT_INTERNAL
 
-    # Optional: log requests
     log {
         output file /var/log/caddy/api.log
     }
 
-    # Optional: security headers (already using helmet in Express, but extra layer)
     header {
         Strict-Transport-Security "max-age=31536000;"
         X-Content-Type-Options nosniff
@@ -274,44 +285,77 @@ $DOMAIN {
 EOF
 
     systemctl reload-or-restart caddy
+}
 
-    # Final output
+print_final_instructions() {
     cat <<EOF
 
 
 ==========================================
-       SECURE WireGuard API Installed!
+       SECURE WireGuard API READY
 ==========================================
 
 Domain:          https://$DOMAIN
-API Token (Bearer):   $API_TOKEN
+Bearer Token:    $API_TOKEN
 
 Create client:
 curl -X POST https://$DOMAIN/create \\
   -H "Authorization: Bearer $API_TOKEN" \\
   -H "Content-Type: application/json"
 
-Remove client (example):
+Remove client:
 curl -X POST https://$DOMAIN/remove \\
   -H "Authorization: Bearer $API_TOKEN" \\
   -H "Content-Type: application/json" \\
-  -d '{"publicKey": "abc...xyz="}'
+  -d '{"publicKey": "your-public-key-here"}'
 
-Security features:
-- HTTPS automatic (Let's Encrypt via Caddy)
-- Bearer token auth (no secret path)
+Features:
+- HTTPS (Let's Encrypt auto-renew)
+- Bearer token auth
 - Rate limiting
-- Helmet security headers
-- Runs as non-root user
-- Node listens only on localhost
+- Security headers
+- Non-root execution
+- Localhost-only Node.js
 
-Keep the token secret!
-Renewal is automatic via Caddy.
-
+Keep token secret. Logs: /var/log/caddy/api.log + journalctl -u $API_SERVICE
 EOF
 }
 
+# ────────────────────────────────────────────────
+# Main Install Orchestrator
+# ────────────────────────────────────────────────
+
+install() {
+    echo "Starting secure WireGuard + HTTPS API installation..."
+
+    detect_out_iface
+    ask_for_domain
+
+    install_packages
+    install_caddy
+    setup_wireguard_keys_and_config
+    enable_ip_forwarding
+    setup_firewall_rules
+    start_wireguard
+    create_api_user
+    setup_api_directory_and_npm
+    generate_api_token
+    write_api_server_js
+    create_api_systemd_service
+    configure_caddy
+    print_final_instructions
+
+    echo ""
+    echo "Installation completed successfully."
+}
+
+# ────────────────────────────────────────────────
+# Uninstall (kept simple for now)
+# ────────────────────────────────────────────────
+
 uninstall() {
+    echo "Uninstalling WireGuard + Secure API..."
+
     systemctl stop wg-quick@"$WG_INTERFACE" 2>/dev/null || true
     systemctl disable wg-quick@"$WG_INTERFACE" 2>/dev/null || true
     systemctl stop "$API_SERVICE" 2>/dev/null || true
@@ -329,30 +373,10 @@ uninstall() {
     iptables -t nat -D POSTROUTING -s "$WG_NETWORK" -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null || true
 
     netfilter-persistent save 2>/dev/null || true
-
     systemctl daemon-reload
 
-    echo "Uninstall complete."
-    echo "Caddy, WireGuard, Node packages still installed."
-    echo "Remove manually if desired: apt remove caddy wireguard nodejs npm iptables-persistent"
-}
-
-show_usage() {
-    cat <<EOF
-
-Usage Examples:
-
-Interactive:
-    sudo ./install-wg.sh
-
-Direct install (custom ports):
-    sudo ./install-wg.sh --port=51830
-
-Uninstall:
-    sudo ./install-wg.sh --uninstall
-
-Note: During first install you'll be asked for a domain name for HTTPS.
-EOF
+    echo "Uninstall finished."
+    echo "Packages (caddy, wireguard, nodejs, ...) still present."
 }
 
 # ────────────────────────────────────────────────
@@ -375,13 +399,13 @@ show_menu() {
     case "$choice" in
         1) install ; read -rp "Press Enter..." ;;
         2) uninstall ; read -rp "Press Enter..." ;;
-        3) show_usage ; read -rp "Press Enter..." ;;
+        3) show_help ; read -rp "Press Enter..." ;;
         0) echo "Goodbye!"; exit 0 ;;
         *) echo "Invalid."; sleep 1 ;;
     esac
 }
 
-# ─── Main ───
+# ─── Entry Point ───
 check_root
 parse_args "$@"
 
