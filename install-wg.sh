@@ -1,16 +1,18 @@
 #!/bin/bash
-# WireGuard + Secure HTTPS API Installer / Manager (Production-ready, modular)
-# Ubuntu/Debian - menu + CLI + Caddy + Bearer token
+# WireGuard + Secure HTTPS API Installer / Manager
+# Ubuntu/Debian – modular, production-ready with Caddy + Bearer token
+# Version: re-done clean – February 2025 style
 
 set -e
 
 # ────────────────────────────────────────────────
-# Configuration / Globals
+# Configuration defaults
 # ────────────────────────────────────────────────
+
 WG_INTERFACE="wg0"
 WG_PORT=51820
 WG_NETWORK="10.66.66.0/24"
-API_PORT_INTERNAL=3001           # Node.js localhost port
+API_PORT_INTERNAL=3001           # Node.js listens here (localhost only)
 API_DIR="/opt/wg-api"
 API_SERVICE="wg-api.service"
 WG_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
@@ -19,99 +21,79 @@ DOMAIN=""
 CADDY_PORT=443
 
 # ────────────────────────────────────────────────
-# CLI Argument Parsing
-# ────────────────────────────────────────────────
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --port=*)           WG_PORT="${1#*=}" ; shift ;;
-            --api-port=*)       API_PORT_INTERNAL="${1#*=}" ; shift ;;
-            --uninstall|-u|--remove) ACTION="uninstall" ; shift ;;
-            --help|-h)          show_help ; exit 0 ;;
-            *) echo "Unknown: $1" ; echo "Use --help" ; exit 1 ;;
-        esac
-    done
-}
-
-show_help() {
-    cat <<EOF
-Usage: sudo $0 [options]
-
-Options:
-  --port=51830          WireGuard UDP port
-  --api-port=4000       Internal Node.js port (localhost)
-  --uninstall           Remove setup
-  --help                This message
-
-No args → interactive menu
-EOF
-}
-
-# ────────────────────────────────────────────────
-# Utility Helpers
+# Utility functions
 # ────────────────────────────────────────────────
 
 check_root() {
-    [ "$EUID" -ne 0 ] && { echo "Must run as root."; exit 1; }
+    if [ "$EUID" -ne 0 ]; then
+        echo "Error: This script must be run as root."
+        exit 1
+    fi
 }
 
-detect_out_iface() {
+detect_outbound_interface() {
     OUT_IFACE=$(ip -4 route show default | awk '{print $5; exit}' || echo "eth0")
-    echo "→ Outbound interface: $OUT_IFACE"
+    echo "→ Detected outbound interface: $OUT_IFACE"
 }
 
-ask_for_domain() {
+ask_domain() {
     echo ""
-    echo "HTTPS requires a domain (e.g. api.vpn.yourdomain.com)"
-    echo "Make sure A record points to this server's public IP."
+    echo "For automatic HTTPS (Let's Encrypt via Caddy) you need a domain."
+    echo "Example: vpn-api.yourdomain.com"
+    echo "The A record must point to this server's public IP."
     echo ""
-    read -rp "Domain: " DOMAIN
-    [[ -z "$DOMAIN" ]] && { echo "Domain required. Aborting."; exit 1; }
+    read -r -p "Enter domain: " DOMAIN
+    if [ -z "$DOMAIN" ]; then
+        echo "Domain is required for secure installation. Aborting."
+        exit 1
+    fi
 }
 
 # ────────────────────────────────────────────────
-# Installation Steps (Modular Functions)
+# Installation steps – each in its own function
 # ────────────────────────────────────────────────
 
-install_packages() {
-    echo "→ Updating package list and installing dependencies..."
+step_install_packages() {
+    echo "→ Installing required packages..."
     apt update -y
     apt install -y wireguard iptables iptables-persistent nodejs npm curl openssl
 }
 
-install_caddy() {
-    echo "→ Installing Caddy (automatic HTTPS)..."
+step_install_caddy() {
+    echo "→ Installing Caddy web server (auto HTTPS)..."
     install -m 0755 -d /etc/apt/keyrings
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        > /etc/apt/sources.list.d/caddy-stable.list
     apt update -y
     apt install -y caddy
 }
 
-setup_wireguard_keys_and_config() {
-    echo "→ Generating WireGuard server keys and config..."
+step_wireguard_keys_config() {
+    echo "→ Generating WireGuard server keys and base config..."
     SERVER_PRIVATE_KEY=$(wg genkey)
     SERVER_PUBLIC_KEY=$(echo "$SERVER_PRIVATE_KEY" | wg pubkey)
 
     mkdir -p /etc/wireguard
-    cat > "$WG_CONFIG" <<EOF
+    cat > "$WG_CONFIG" <<END
 [Interface]
 Address = 10.66.66.1/24
 ListenPort = $WG_PORT
 PrivateKey = $SERVER_PRIVATE_KEY
 SaveConfig = true
-EOF
+END
     chmod 600 "$WG_CONFIG"
 }
 
-enable_ip_forwarding() {
+step_enable_ip_forward() {
     echo "→ Enabling IP forwarding..."
     sysctl -w net.ipv4.ip_forward=1
     sed -i 's/^#\{0,1\}net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
 }
 
-setup_firewall_rules() {
-    echo "→ Configuring iptables rules..."
+step_firewall_rules() {
+    echo "→ Setting up basic iptables rules..."
     iptables -A INPUT -p udp --dport "$WG_PORT" -j ACCEPT
     iptables -A FORWARD -i "$WG_INTERFACE" -j ACCEPT
     iptables -A FORWARD -o "$WG_INTERFACE" -j ACCEPT
@@ -119,18 +101,18 @@ setup_firewall_rules() {
     netfilter-persistent save
 }
 
-start_wireguard() {
-    echo "→ Enabling and starting WireGuard..."
+step_start_wireguard() {
+    echo "→ Enabling & starting WireGuard interface..."
     systemctl enable --now wg-quick@"$WG_INTERFACE"
 }
 
-create_api_user() {
-    echo "→ Creating non-root API user (wgapi)..."
+step_create_api_user() {
+    echo "→ Creating non-root user for API (wgapi)..."
     id wgapi 2>/dev/null || useradd -r -s /usr/sbin/nologin wgapi
 }
 
-setup_api_directory_and_npm() {
-    echo "→ Setting up API directory and installing npm packages..."
+step_api_npm_setup() {
+    echo "→ Preparing API directory and npm dependencies..."
     mkdir -p "$API_DIR"
     chown wgapi:wgapi "$API_DIR"
     cd "$API_DIR" || exit 1
@@ -139,16 +121,17 @@ setup_api_directory_and_npm() {
     npm install express express-rate-limit helmet >/dev/null 2>&1
 }
 
-generate_api_token() {
+step_generate_token() {
     API_TOKEN=$(openssl rand -hex 32)
-    echo "→ Generated API Bearer token: $API_TOKEN"
+    echo "→ Generated Bearer token: $API_TOKEN"
 }
 
-write_api_server_js() {
-    echo "→ Writing secure Node.js API server (localhost only)..."
+step_write_server_js() {
+    echo "→ Writing Node.js API code (localhost only + auth)..."
+
     SERVER_IP=$(curl -s ifconfig.me || echo "your-public-ip")
 
-    cat > server.js <<EOF
+    cat > server.js <<END
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
@@ -159,19 +142,17 @@ const app = express();
 app.use(helmet());
 app.use(express.json());
 
-// Rate limiting
 app.use(rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 60,
-  message: { error: 'Too many requests' }
+  message: { error: 'Too many requests, try again later.' }
 }));
 
-// Bearer token authentication
 const API_TOKEN = '$API_TOKEN';
 app.use((req, res, next) => {
   const auth = req.headers.authorization;
   if (!auth || auth !== \`Bearer \${API_TOKEN}\`) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(401).json({ error: 'Unauthorized – invalid or missing token' });
   }
   next();
 });
@@ -188,7 +169,7 @@ function getNextIP() {
   const matches = config.match(/10\\.66\\.66\\.(\\d+)/g) || [];
   const used = matches.map(ip => parseInt(ip.split('.').pop()));
   const next = used.length ? Math.max(...used) + 1 : 2;
-  if (next > 254) throw new Error('IP range exhausted');
+  if (next > 254) throw new Error('IP range exhausted (10.66.66.2–254)');
   return BASE_IP + next;
 }
 
@@ -237,16 +218,16 @@ app.post('/remove', (req, res) => {
 });
 
 app.listen($API_PORT_INTERNAL, '127.0.0.1', () => {
-  console.log('API running on localhost:$API_PORT_INTERNAL');
+  console.log('Secure API listening on localhost:$API_PORT_INTERNAL');
 });
-EOF
+END
 
     chown -R wgapi:wgapi "$API_DIR"
 }
 
-create_api_systemd_service() {
-    echo "→ Creating systemd service for API (non-root)..."
-    cat > "/etc/systemd/system/$API_SERVICE" <<EOF
+step_create_systemd_service() {
+    echo "→ Creating systemd service for the API..."
+    cat > "/etc/systemd/system/$API_SERVICE" <<END
 [Unit]
 Description=WireGuard Secure API
 After=network.target
@@ -260,20 +241,20 @@ WorkingDirectory=$API_DIR
 
 [Install]
 WantedBy=multi-user.target
-EOF
+END
 
     systemctl daemon-reload
     systemctl enable --now "$API_SERVICE"
 }
 
-configure_caddy() {
-    echo "→ Configuring Caddy reverse proxy + automatic HTTPS..."
-    cat > /etc/caddy/Caddyfile <<EOF
+step_configure_caddy() {
+    echo "→ Configuring Caddy (HTTPS reverse proxy)..."
+    cat > /etc/caddy/Caddyfile <<END
 $DOMAIN {
     reverse_proxy 127.0.0.1:$API_PORT_INTERNAL
 
     log {
-        output file /var/log/caddy/api.log
+        output file /var/log/caddy/wg-api.log
     }
 
     header {
@@ -282,138 +263,178 @@ $DOMAIN {
         X-Frame-Options DENY
     }
 }
-EOF
+END
 
-    systemctl reload-or-restart caddy
+    systemctl restart caddy
 }
 
-print_final_instructions() {
-    cat <<EOF
-
-
-==========================================
-       SECURE WireGuard API READY
-==========================================
-
-Domain:          https://$DOMAIN
-Bearer Token:    $API_TOKEN
-
-Create client:
-curl -X POST https://$DOMAIN/create \\
-  -H "Authorization: Bearer $API_TOKEN" \\
-  -H "Content-Type: application/json"
-
-Remove client:
-curl -X POST https://$DOMAIN/remove \\
-  -H "Authorization: Bearer $API_TOKEN" \\
-  -H "Content-Type: application/json" \\
-  -d '{"publicKey": "your-public-key-here"}'
-
-Features:
-- HTTPS (Let's Encrypt auto-renew)
-- Bearer token auth
-- Rate limiting
-- Security headers
-- Non-root execution
-- Localhost-only Node.js
-
-Keep token secret. Logs: /var/log/caddy/api.log + journalctl -u $API_SERVICE
-EOF
+print_success_message() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "                SECURE WIREGUARD API INSTALLED"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "  Domain:          https://$DOMAIN"
+    echo "  Bearer Token:    $API_TOKEN"
+    echo ""
+    echo "  Create client config:"
+    echo "  curl -X POST https://$DOMAIN/create \\"
+    echo "    -H \"Authorization: Bearer $API_TOKEN\" \\"
+    echo "    -H \"Content-Type: application/json\""
+    echo ""
+    echo "  Remove client (example):"
+    echo "  curl -X POST https://$DOMAIN/remove \\"
+    echo "    -H \"Authorization: Bearer $API_TOKEN\" \\"
+    echo "    -H \"Content-Type: application/json\" \\"
+    echo "    -d '{\"publicKey\": \"...\"}'"
+    echo ""
+    echo "  Logs:"
+    echo "    Caddy:     /var/log/caddy/wg-api.log"
+    echo "    Service:   journalctl -u $API_SERVICE -f"
+    echo ""
+    echo "  Security notes:"
+    echo "  • Keep the token secret"
+    echo "  • HTTPS is automatic via Let's Encrypt"
+    echo "  • Node.js runs as non-root user wgapi"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
 }
 
 # ────────────────────────────────────────────────
-# Main Install Orchestrator
+# Main install function (orchestrator)
 # ────────────────────────────────────────────────
 
 install() {
     echo "Starting secure WireGuard + HTTPS API installation..."
-
-    detect_out_iface
-    ask_for_domain
-
-    install_packages
-    install_caddy
-    setup_wireguard_keys_and_config
-    enable_ip_forwarding
-    setup_firewall_rules
-    start_wireguard
-    create_api_user
-    setup_api_directory_and_npm
-    generate_api_token
-    write_api_server_js
-    create_api_systemd_service
-    configure_caddy
-    print_final_instructions
-
     echo ""
-    echo "Installation completed successfully."
+
+    detect_outbound_interface
+    ask_domain
+
+    step_install_packages
+    step_install_caddy
+    step_wireguard_keys_config
+    step_enable_ip_forward
+    step_firewall_rules
+    step_start_wireguard
+    step_create_api_user
+    step_api_npm_setup
+    step_generate_token
+    step_write_server_js
+    step_create_systemd_service
+    step_configure_caddy
+    print_success_message
+
+    echo "Done."
 }
 
 # ────────────────────────────────────────────────
-# Uninstall (kept simple for now)
+# Uninstall
 # ────────────────────────────────────────────────
 
 uninstall() {
-    echo "Uninstalling WireGuard + Secure API..."
+    echo "Uninstalling WireGuard + Secure API setup..."
 
-    systemctl stop wg-quick@"$WG_INTERFACE" 2>/dev/null || true
-    systemctl disable wg-quick@"$WG_INTERFACE" 2>/dev/null || true
-    systemctl stop "$API_SERVICE" 2>/dev/null || true
-    systemctl disable "$API_SERVICE" 2>/dev/null || true
-    systemctl stop caddy 2>/dev/null || true
+    systemctl stop wg-quick@"$WG_INTERFACE"     2>/dev/null || true
+    systemctl disable wg-quick@"$WG_INTERFACE"  2>/dev/null || true
+    systemctl stop "$API_SERVICE"               2>/dev/null || true
+    systemctl disable "$API_SERVICE"            2>/dev/null || true
+    systemctl stop caddy                        2>/dev/null || true
 
     rm -f "/etc/systemd/system/$API_SERVICE"
     rm -rf "$API_DIR"
     rm -f "$WG_CONFIG"
     rm -f /etc/caddy/Caddyfile
 
-    iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -o "$WG_INTERFACE" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT                       2>/dev/null || true
+    iptables -D FORWARD -i "$WG_INTERFACE" -j ACCEPT                            2>/dev/null || true
+    iptables -D FORWARD -o "$WG_INTERFACE" -j ACCEPT                            2>/dev/null || true
     iptables -t nat -D POSTROUTING -s "$WG_NETWORK" -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null || true
 
     netfilter-persistent save 2>/dev/null || true
     systemctl daemon-reload
 
+    echo ""
     echo "Uninstall finished."
-    echo "Packages (caddy, wireguard, nodejs, ...) still present."
+    echo "Packages (caddy, wireguard, nodejs, npm, iptables-persistent) still installed."
+    echo "Remove them manually if you want: apt remove ..."
 }
 
 # ────────────────────────────────────────────────
-# Menu
+# CLI argument parsing
+# ────────────────────────────────────────────────
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port=*)           WG_PORT="${1#*=}" ; shift ;;
+            --api-port=*)       API_PORT_INTERNAL="${1#*=}" ; shift ;;
+            --uninstall|-u)     ACTION="uninstall" ; shift ;;
+            --help|-h)          show_help ; exit 0 ;;
+            *) echo "Unknown argument: $1" ; show_help ; exit 1 ;;
+        esac
+    done
+}
+
+show_help() {
+    echo "========================================"
+    echo "  WireGuard + Secure API Manager"
+    echo "========================================"
+    echo ""
+    echo "Usage:"
+    echo "  sudo ./install-wg.sh                  → interactive menu"
+    echo "  sudo ./install-wg.sh --help           → this help"
+    echo "  sudo ./install-wg.sh --uninstall      → remove setup"
+    echo "  sudo ./install-wg.sh --port=51830     → custom WireGuard port"
+    echo "  sudo ./install-wg.sh --api-port=4000  → custom internal API port"
+    echo ""
+    echo "Note: During interactive install you will be asked for a domain."
+    echo "========================================"
+}
+
+# ────────────────────────────────────────────────
+# Interactive menu
 # ────────────────────────────────────────────────
 
 show_menu() {
     clear
-    echo "======================================"
-    echo "     Secure WireGuard Manager        "
-    echo "======================================"
+    echo "========================================"
+    echo "     Secure WireGuard Manager"
+    echo "========================================"
     echo ""
-    echo "1) Install WireGuard + Secure HTTPS API"
-    echo "2) Uninstall"
-    echo "3) Usage"
-    echo "0) Exit"
+    echo "  1) Install WireGuard + HTTPS API"
+    echo "  2) Uninstall"
+    echo "  3) Usage / Help"
+    echo "  0) Exit"
     echo ""
-    read -rp "Choose: " choice
+    read -r -p "Choose [0-3]: " choice
 
     case "$choice" in
-        1) install ; read -rp "Press Enter..." ;;
-        2) uninstall ; read -rp "Press Enter..." ;;
-        3) show_help ; read -rp "Press Enter..." ;;
-        0) echo "Goodbye!"; exit 0 ;;
-        *) echo "Invalid."; sleep 1 ;;
+        1) install ; read -r -p "Press Enter to continue..." ;;
+        2) uninstall ; read -r -p "Press Enter to continue..." ;;
+        3) show_help ; read -r -p "Press Enter to continue..." ;;
+        0) echo "Goodbye."; exit 0 ;;
+        *) echo "Invalid choice."; sleep 1 ;;
     esac
 }
 
-# ─── Entry Point ───
+# ────────────────────────────────────────────────
+# Entry point
+# ────────────────────────────────────────────────
+
 check_root
 parse_args "$@"
 
 if [ -n "$ACTION" ]; then
-    [ "$ACTION" = "uninstall" ] && uninstall || install
+    if [ "$ACTION" = "uninstall" ]; then
+        uninstall
+    else
+        install
+    fi
     exit 0
 fi
 
+# Interactive mode
 while true; do
     show_menu
 done
