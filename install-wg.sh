@@ -56,19 +56,25 @@ ask_domain() {
 step_install_packages() {
     echo "→ Installing required packages..."
     apt update -y
-    apt install -y wireguard iptables iptables-persistent nodejs npm curl openssl
+    #apt install -y wireguard iptables iptables-persistent nodejs npm curl openssl
+    apt install -y \
+        wireguard \
+        iptables \
+        iptables-persistent \
+        nodejs \
+        npm \
+        curl \
+        openssl \
+        gnupg
+
 }
 
 step_install_caddy() {
-    echo "→ Installing Caddy web server (auto HTTPS)..."
-    install -m 0755 -d /etc/apt/keyrings
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-        > /etc/apt/sources.list.d/caddy-stable.list
-    apt update -y
+    echo "→ Installing Caddy web server..."
     apt install -y caddy
 }
+
+
 
 step_wireguard_keys_config() {
     echo "→ Generating WireGuard server keys and base config..."
@@ -312,18 +318,20 @@ install() {
     ask_domain
 
     step_install_packages
+    echo "Instaling Packages Done..."
     step_install_caddy
-    step_wireguard_keys_config
-    step_enable_ip_forward
-    step_firewall_rules
-    step_start_wireguard
-    step_create_api_user
-    step_api_npm_setup
-    step_generate_token
-    step_write_server_js
-    step_create_systemd_service
-    step_configure_caddy
-    print_success_message
+    echo "Install Caddy Done..."
+    #step_wireguard_keys_config
+    #step_enable_ip_forward
+    #step_firewall_rules
+    #step_start_wireguard
+    #step_create_api_user
+    #step_api_npm_setup
+    #step_generate_token
+    #step_write_server_js
+    #step_create_systemd_service
+    #step_configure_caddy
+    #print_success_message
 
     echo "Done."
 }
