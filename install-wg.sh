@@ -321,9 +321,12 @@ install() {
     echo "Instaling Packages Done..."
     step_install_caddy
     echo "Install Caddy Done..."
-    #step_wireguard_keys_config
-    #step_enable_ip_forward
+    step_wireguard_keys_config
+    echo "wireguard key config Done..."
+    step_enable_ip_forward
+    echo "Enable IP forward Done..."
     #step_firewall_rules
+    #echo "forewall rules Done..."
     #step_start_wireguard
     #step_create_api_user
     #step_api_npm_setup
