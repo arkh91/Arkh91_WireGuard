@@ -325,9 +325,9 @@ install() {
     echo "wireguard key config Done..."
     step_enable_ip_forward
     echo "Enable IP forward Done..."
-    #step_firewall_rules
-    #echo "forewall rules Done..."
-    #step_start_wireguard
+    step_firewall_rules
+    echo "forewall rules Done..."
+    step_start_wireguard
     #step_create_api_user
     #step_api_npm_setup
     #step_generate_token
