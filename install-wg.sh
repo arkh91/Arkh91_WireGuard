@@ -235,12 +235,22 @@ const WG_PORT = '$WG_PORT';
 const BASE_IP = '10.66.66.';
 
 function getNextIP() {
-  const config = fs.readFileSync(WG_CONFIG, 'utf8');
-  const matches = config.match(/10\\.66\\.66\\.(\\d+)/g) || [];
-  const used = matches.map(ip => parseInt(ip.split('.').pop()));
-  const next = used.length ? Math.max(...used) + 1 : 2;
-  if (next > 254) throw new Error('IP range exhausted (10.66.66.2–254)');
-  return BASE_IP + next;
+  try {
+    const config = fs.readFileSync(WG_CONFIG, 'utf8');
+
+    const matches = config.match(/10\\.66\\.66\\.(\\d+)/g) || [];
+    const used = matches.map(ip => parseInt(ip.split('.').pop()));
+
+    const next = used.length ? Math.max(...used) + 1 : 2;
+
+    if (next > 254) {
+      throw new Error('IP range exhausted (10.66.66.2–254)');
+    }
+
+    return BASE_IP + next;
+  } catch (err) {
+    return BASE_IP + 2;
+  }
 }
 
 app.post('/create', (req, res) => {
@@ -249,10 +259,27 @@ app.post('/create', (req, res) => {
     const publicKey = execSync(\`echo \${privateKey} | wg pubkey\`).toString().trim();
     const clientIP = getNextIP();
 
-    
-    fs.appendFileSync(WG_CONFIG, peerBlock);
-    execSync(\`wg set \${WG_INTERFACE} peer \${publicKey} allowed-ips \${clientIP}/32\`);
+    // ─────────────────────────────
+    // 1. Persist in wg config file
+    // ─────────────────────────────
+    const peerBlock = \`
+[Peer]
+PublicKey = \${publicKey}
+AllowedIPs = \${clientIP}/32
+\`;
 
+    fs.appendFileSync(WG_CONFIG, peerBlock);
+
+    // ─────────────────────────────
+    // 2. Apply runtime via sudo script
+    // ─────────────────────────────
+    execSync(\`sudo /usr/local/bin/wg-provision \${publicKey} \${clientIP}\`, {
+      stdio: 'inherit'
+    });
+
+    // ─────────────────────────────
+    // 3. Return client config
+    // ─────────────────────────────
     const clientConfig = \`
 [Interface]
 PrivateKey = \${privateKey}
@@ -267,6 +294,7 @@ PersistentKeepalive = 25
 \`.trim();
 
     res.json({ success: true, config: clientConfig });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -275,9 +303,14 @@ PersistentKeepalive = 25
 app.post('/remove', (req, res) => {
   const { publicKey } = req.body;
   if (!publicKey) return res.status(400).json({ error: 'publicKey required' });
+
   try {
-    execSync(\`wg set \${WG_INTERFACE} peer \${publicKey} remove\`);
+    execSync(\`sudo /usr/local/bin/wg-remove \${publicKey}\`, {
+      stdio: 'inherit'
+    });
+
     res.json({ success: true });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -290,7 +323,6 @@ END
 
     chown -R wgapi:wgapi "$API_DIR"
 }
-
 step_create_systemd_service() {
     echo "→ Creating systemd service for the API..."
     cat > "/etc/systemd/system/$API_SERVICE" <<END
