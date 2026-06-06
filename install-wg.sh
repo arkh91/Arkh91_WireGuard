@@ -65,13 +65,26 @@ step_install_packages() {
         npm \
         curl \
         openssl \
-        gnupg
-
+        gnupg \
+        sudo
 }
 
 step_install_caddy() {
     echo "→ Installing Caddy web server..."
-    apt install -y caddy
+
+    # 1. Install necessary prerequisite packages
+    sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+    
+    # 2. Download and save the official Caddy GPG security key
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    
+    # 3. Add the Caddy repository to your sources list
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+    
+    # 4. Update your package manager lists and install Caddy
+    #sudo apt update
+    sudo apt install -y caddy
+
 }
 
 
