@@ -78,18 +78,28 @@ step_install_caddy() {
 
 step_wireguard_keys_config() {
     echo "→ Generating WireGuard server keys and base config..."
+
     SERVER_PRIVATE_KEY=$(wg genkey)
     SERVER_PUBLIC_KEY=$(echo "$SERVER_PRIVATE_KEY" | wg pubkey)
 
     mkdir -p /etc/wireguard
+
     cat > "$WG_CONFIG" <<END
 [Interface]
 Address = 10.66.66.1/24
 ListenPort = $WG_PORT
 PrivateKey = $SERVER_PRIVATE_KEY
-SaveConfig = true
 END
+
     chmod 600 "$WG_CONFIG"
+
+    # Save keys for API use
+    echo "$SERVER_PRIVATE_KEY" > /etc/wireguard/server_private.key
+    echo "$SERVER_PUBLIC_KEY" > /etc/wireguard/server_public.key
+    chmod 600 /etc/wireguard/server_private.key
+    chmod 644 /etc/wireguard/server_public.key
+
+    echo "→ Server public key: $SERVER_PUBLIC_KEY"
 }
 
 step_enable_ip_forward() {
