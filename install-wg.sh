@@ -328,6 +328,7 @@ install() {
     step_firewall_rules
     echo "forewall rules Done..."
     step_start_wireguard
+    
     #step_create_api_user
     #step_api_npm_setup
     #step_generate_token
