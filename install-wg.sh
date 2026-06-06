@@ -315,7 +315,6 @@ function getNextIP() {
     return BASE_IP + 2;
   }
 }
-}
 
 app.post('/create', (req, res) => {
   try {
