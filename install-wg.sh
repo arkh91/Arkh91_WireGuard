@@ -199,9 +199,23 @@ step_generate_token() {
 step_write_server_js() {
     echo "→ Writing Node.js API code (localhost only + auth)..."
 
+    # ────────────────────────────────────────────────
+    # Re-fetch values at write time (critical fix)
+    # ────────────────────────────────────────────────
     SERVER_IP=$(curl -s ifconfig.me || echo "your-public-ip")
 
-    cat > server.js <<END
+    # Read the public key from disk (this was the main bug)
+    if [ -f "/etc/wireguard/server_public.key" ]; then
+        SERVER_PUBLIC_KEY=$(cat /etc/wireguard/server_public.key)
+    else
+        echo "⚠️  Warning: server_public.key not found. Using placeholder."
+        SERVER_PUBLIC_KEY="SERVER_PUBLIC_KEY_MISSING"
+    fi
+
+    # Optional: also read private key if ever needed in the future
+    # SERVER_PRIVATE_KEY=$(cat /etc/wireguard/server_private.key 2>/dev/null || echo "")
+
+    cat > "$API_DIR/server.js" << 'END'
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
@@ -218,27 +232,27 @@ app.use(rateLimit({
   message: { error: 'Too many requests, try again later.' }
 }));
 
-const API_TOKEN = '$API_TOKEN';
+const API_TOKEN = '${API_TOKEN}';
 app.use((req, res, next) => {
   const auth = req.headers.authorization;
-  if (!auth || auth !== \`Bearer \${API_TOKEN}\`) {
+  if (!auth || auth !== `Bearer ${API_TOKEN}`) {
     return res.status(401).json({ error: 'Unauthorized – invalid or missing token' });
   }
   next();
 });
 
-const WG_INTERFACE = '$WG_INTERFACE';
-const WG_CONFIG = '$WG_CONFIG';
-const SERVER_IP = '$SERVER_IP';
-const SERVER_PUBLIC_KEY = '$SERVER_PUBLIC_KEY';
-const WG_PORT = '$WG_PORT';
+const WG_INTERFACE = '${WG_INTERFACE}';
+const WG_CONFIG = '${WG_CONFIG}';
+const SERVER_IP = '${SERVER_IP}';
+const SERVER_PUBLIC_KEY = '${SERVER_PUBLIC_KEY}';
+const WG_PORT = ${WG_PORT};
 const BASE_IP = '10.66.66.';
 
 function getNextIP() {
   try {
     const config = fs.readFileSync(WG_CONFIG, 'utf8');
 
-    const matches = config.match(/10\\.66\\.66\\.(\\d+)/g) || [];
+    const matches = config.match(/10\.66\.66\.(\d+)/g) || [];
     const used = matches.map(ip => parseInt(ip.split('.').pop()));
 
     const next = used.length ? Math.max(...used) + 1 : 2;
@@ -249,6 +263,7 @@ function getNextIP() {
 
     return BASE_IP + next;
   } catch (err) {
+    console.warn('Failed to parse config, falling back to .2');
     return BASE_IP + 2;
   }
 }
@@ -256,46 +271,41 @@ function getNextIP() {
 app.post('/create', (req, res) => {
   try {
     const privateKey = execSync('wg genkey').toString().trim();
-    const publicKey = execSync(\`echo \${privateKey} | wg pubkey\`).toString().trim();
+    const publicKey = execSync(`echo ${privateKey} | wg pubkey`).toString().trim();
     const clientIP = getNextIP();
 
-    // ─────────────────────────────
     // 1. Persist in wg config file
-    // ─────────────────────────────
-    const peerBlock = \`
+    const peerBlock = `
 [Peer]
-PublicKey = \${publicKey}
-AllowedIPs = \${clientIP}/32
-\`;
+PublicKey = ${publicKey}
+AllowedIPs = ${clientIP}/32
+`;
 
     fs.appendFileSync(WG_CONFIG, peerBlock);
 
-    // ─────────────────────────────
-    // 2. Apply runtime via sudo script
-    // ─────────────────────────────
-    execSync(\`sudo /usr/local/bin/wg-provision \${publicKey} \${clientIP}\`, {
+    // 2. Apply runtime
+    execSync(`sudo /usr/local/bin/wg-provision ${publicKey} ${clientIP}`, {
       stdio: 'inherit'
     });
 
-    // ─────────────────────────────
     // 3. Return client config
-    // ─────────────────────────────
-    const clientConfig = \`
+    const clientConfig = `
 [Interface]
-PrivateKey = \${privateKey}
-Address = \${clientIP}/32
+PrivateKey = ${privateKey}
+Address = ${clientIP}/32
 DNS = 1.1.1.1
 
 [Peer]
-PublicKey = \${SERVER_PUBLIC_KEY}
-Endpoint = \${SERVER_IP}:\${WG_PORT}
+PublicKey = ${SERVER_PUBLIC_KEY}
+Endpoint = \( {SERVER_IP}: \){WG_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
-\`.trim();
+`.trim();
 
     res.json({ success: true, config: clientConfig });
 
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -305,24 +315,27 @@ app.post('/remove', (req, res) => {
   if (!publicKey) return res.status(400).json({ error: 'publicKey required' });
 
   try {
-    execSync(\`sudo /usr/local/bin/wg-remove \${publicKey}\`, {
+    execSync(`sudo /usr/local/bin/wg-remove ${publicKey}`, {
       stdio: 'inherit'
     });
 
     res.json({ success: true });
 
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.listen($API_PORT_INTERNAL, '127.0.0.1', () => {
-  console.log('Secure API listening on localhost:$API_PORT_INTERNAL');
+app.listen(${API_PORT_INTERNAL}, '127.0.0.1', () => {
+  console.log(`Secure API listening on localhost:${API_PORT_INTERNAL}`);
 });
 END
 
     chown -R wgapi:wgapi "$API_DIR"
+    echo "✓ server.js written successfully"
 }
+
 step_create_systemd_service() {
     echo "→ Creating systemd service for the API..."
     cat > "/etc/systemd/system/$API_SERVICE" <<END
