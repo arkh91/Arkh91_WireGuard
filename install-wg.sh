@@ -117,6 +117,60 @@ step_create_api_user() {
     id wgapi 2>/dev/null || useradd -r -s /usr/sbin/nologin wgapi
 }
 
+step_install_wg_provision() {
+    echo "→ Installing wg-provision..."
+
+    cat > /usr/local/bin/wg-provision << 'EOF'
+#!/bin/bash
+set -e
+
+WG_IF="wg0"
+PUBLIC_KEY="$1"
+IP="$2"
+
+if [ -z "$PUBLIC_KEY" ] || [ -z "$IP" ]; then
+  echo "Usage: wg-provision <public-key> <ip>"
+  exit 1
+fi
+
+/usr/bin/wg set "$WG_IF" peer "$PUBLIC_KEY" allowed-ips "$IP/32"
+EOF
+
+    chmod +x /usr/local/bin/wg-provision
+}
+
+step_install_wg_remove() {
+    echo "→ Installing wg-remove..."
+
+    cat > /usr/local/bin/wg-remove << 'EOF'
+#!/bin/bash
+set -e
+
+WG_IF="wg0"
+PUBLIC_KEY="$1"
+
+if [ -z "$PUBLIC_KEY" ]; then
+  echo "Usage: wg-remove <public-key>"
+  exit 1
+fi
+
+/usr/bin/wg set "$WG_IF" peer "$PUBLIC_KEY" remove
+EOF
+
+    chmod +x /usr/local/bin/wg-remove
+}
+
+step_configure_sudoers() {
+    echo "→ Configuring sudo permissions for wgapi..."
+
+    cat > /etc/sudoers.d/wgapi << 'EOF'
+wgapi ALL=(root) NOPASSWD: /usr/local/bin/wg-provision
+wgapi ALL=(root) NOPASSWD: /usr/local/bin/wg-remove
+EOF
+
+    chmod 440 /etc/sudoers.d/wgapi
+}
+
 step_api_npm_setup() {
     echo "→ Preparing API directory and npm dependencies..."
     mkdir -p "$API_DIR"
@@ -329,6 +383,11 @@ install() {
     echo "forewall rules Done..."
     step_start_wireguard
     step_create_api_user
+
+    step_install_wg_provision
+    step_install_wg_remove
+    step_configure_sudoers
+
     step_api_npm_setup
     step_generate_token
     step_write_server_js
