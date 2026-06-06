@@ -215,7 +215,7 @@ step_write_server_js() {
     # Optional: also read private key if ever needed in the future
     # SERVER_PRIVATE_KEY=$(cat /etc/wireguard/server_private.key 2>/dev/null || echo "")
 
-    cat > "$API_DIR/server.js" << 'END'
+    cat > "$API_DIR/server.js" << END 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
