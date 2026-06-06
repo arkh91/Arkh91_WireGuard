@@ -150,13 +150,13 @@ EOF
 }
 
 step_install_wg_remove() {
-    echo "→ Installing wg-remove..."
-
-    cat > /usr/local/bin/wg-remove << 'EOF'
+  echo "→ Installing wg-remove..."
+  cat > /usr/local/bin/wg-remove << 'EOF'
 #!/bin/bash
 set -e
 
 WG_IF="wg0"
+WG_CONFIG="/etc/wireguard/${WG_IF}.conf"
 PUBLIC_KEY="$1"
 
 if [ -z "$PUBLIC_KEY" ]; then
@@ -164,10 +164,47 @@ if [ -z "$PUBLIC_KEY" ]; then
   exit 1
 fi
 
+# ── Step 1: Remove from live interface ──────────
 /usr/bin/wg set "$WG_IF" peer "$PUBLIC_KEY" remove
-EOF
+echo "Removed peer from live interface: $PUBLIC_KEY"
 
-    chmod +x /usr/local/bin/wg-remove
+# ── Step 2: Remove [Peer] block from config file ─
+# Strategy: read the file, skip the block that contains our key,
+# write everything else back. Uses awk for reliable multi-line matching.
+TMPFILE=$(mktemp)
+
+awk -v key="$PUBLIC_KEY" '
+  /^\[Peer\]/ {
+    # Buffer this section until we know if it is ours
+    block = $0 "\n"
+    in_peer = 1
+    next
+  }
+  in_peer {
+    # Another section header means the buffered block is done
+    if (/^\[/) {
+      if (block !~ key) printf "%s", block
+      block = ""
+      in_peer = 0
+      # Fall through and print this new header normally
+    } else {
+      block = block $0 "\n"
+      next
+    }
+  }
+  # Flush buffered peer block at end of file
+  END {
+    if (in_peer && block !~ key) printf "%s", block
+  }
+  { print }
+' "$WG_CONFIG" > "$TMPFILE"
+
+mv "$TMPFILE" "$WG_CONFIG"
+chmod 600 "$WG_CONFIG"
+
+echo "Removed peer block from $WG_CONFIG"
+EOF
+  chmod +x /usr/local/bin/wg-remove
 }
 
 step_configure_sudoers() {
