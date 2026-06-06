@@ -333,6 +333,7 @@ install() {
     step_generate_token
     step_write_server_js
     step_create_systemd_service
+    
     #step_configure_caddy
     #print_success_message
 
