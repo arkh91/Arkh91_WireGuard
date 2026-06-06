@@ -249,11 +249,7 @@ app.post('/create', (req, res) => {
     const publicKey = execSync(\`echo \${privateKey} | wg pubkey\`).toString().trim();
     const clientIP = getNextIP();
 
-    const peerBlock = \`
-[Peer]
-PublicKey = \${publicKey}
-AllowedIPs = \${clientIP}/32
-\`;
+    
     fs.appendFileSync(WG_CONFIG, peerBlock);
     execSync(\`wg set \${WG_INTERFACE} peer \${publicKey} allowed-ips \${clientIP}/32\`);
 
