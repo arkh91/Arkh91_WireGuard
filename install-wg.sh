@@ -280,7 +280,7 @@ app.use((req, res, next) => {
 
 const WG_INTERFACE = '${WG_INTERFACE}';
 const WG_CONFIG = '${WG_CONFIG}';
-const SERVER_IP = '${SERVER_IP}';
+const SERVER_ENDPOINT = '${DOMAIN}';
 const SERVER_PUBLIC_KEY = '${SERVER_PUBLIC_KEY}';
 const WG_PORT = ${WG_PORT};
 const BASE_IP = '10.66.66.';
@@ -333,7 +333,7 @@ DNS = 1.1.1.1
 
 [Peer]
 PublicKey = ${SERVER_PUBLIC_KEY}
-Endpoint = ${SERVER_IP}:${WG_PORT}
+Endpoint = ${SERVER_ENDPOINT}:${WG_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 `.trim();
