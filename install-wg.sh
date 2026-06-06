@@ -288,21 +288,20 @@ const BASE_IP = '10.66.66.';
 function getNextIP() {
   try {
     const config = fs.readFileSync(WG_CONFIG, 'utf8');
-
     const matches = config.match(/10\.66\.66\.(\d+)/g) || [];
     const used = matches.map(ip => parseInt(ip.split('.').pop()));
-
-    const next = used.length ? Math.max(...used) + 1 : 2;
-
-    if (next > 254) {
-      throw new Error('IP range exhausted (10.66.66.2–254)');
+    for (let i = 2; i <= 254; i++) {
+      if (!used.includes(i)) {
+        return BASE_IP + i;
+      }
     }
-
-    return BASE_IP + next;
+    throw new Error('IP range exhausted (10.66.66.2–254)');
   } catch (err) {
+    if (err.message.includes('exhausted')) throw err;
     console.warn('Failed to parse config, falling back to .2');
     return BASE_IP + 2;
   }
+}
 }
 
 app.post('/create', (req, res) => {
