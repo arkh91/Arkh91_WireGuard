@@ -12,7 +12,7 @@ set -e
 WG_INTERFACE="wg0"
 WG_PORT=51820
 WG_NETWORK="10.66.66.0/24"
-API_PORT_INTERNAL=3001           # Node.js listens here (localhost only)
+API_PORT_INTERNAL=4242           # Node.js listens here (localhost only)
 API_DIR="/opt/wg-api"
 API_SERVICE="wg-api.service"
 WG_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
