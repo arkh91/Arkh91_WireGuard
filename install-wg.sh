@@ -72,19 +72,90 @@ step_install_packages() {
 step_install_caddy() {
     echo "→ Installing Caddy web server..."
 
-    # 1. Install necessary prerequisite packages
-    sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
-    
-    # 2. Download and save the official Caddy GPG security key
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    
-    # 3. Add the Caddy repository to your sources list
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-    
-    # 4. Update your package manager lists and install Caddy
-    #sudo apt update
-    sudo apt install -y caddy
+    # Detect OS
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+    else
+        echo "✗ Unable to detect Linux distribution"
+        return 1
+    fi
 
+    case "$ID" in
+        ubuntu|debian|linuxmint|pop|kali|raspbian)
+            apt update
+
+            apt install -y \
+                debian-keyring \
+                debian-archive-keyring \
+                apt-transport-https \
+                curl \
+                gnupg
+
+            mkdir -p /usr/share/keyrings
+
+            curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+                | gpg --dearmor \
+                -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+            curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+                -o /etc/apt/sources.list.d/caddy-stable.list
+
+            apt update
+            apt install -y caddy
+            ;;
+
+        rocky|almalinux|rhel|centos)
+            dnf install -y 'dnf-command(copr)'
+            dnf copr enable -y @caddy/caddy
+            dnf install -y caddy
+            ;;
+
+        fedora)
+            dnf install -y caddy
+            ;;
+
+        arch|manjaro)
+            pacman -Sy --noconfirm caddy
+            ;;
+
+        opensuse-leap|opensuse-tumbleweed|opensuse)
+            zypper --non-interactive refresh
+            zypper --non-interactive install caddy
+            ;;
+
+        *)
+            echo "✗ Unsupported Linux distribution:"
+            echo "  $PRETTY_NAME"
+            echo
+            echo "Official installation instructions:"
+            echo "https://caddyserver.com/docs/install"
+            return 1
+            ;;
+    esac
+
+    # Verify binary exists
+    if ! command -v caddy >/dev/null 2>&1; then
+        echo "✗ Caddy binary not found after installation"
+        return 1
+    fi
+
+    # Enable and start service
+    systemctl daemon-reload
+    systemctl enable caddy >/dev/null 2>&1
+    systemctl restart caddy
+
+    # Verify service is running
+    if ! systemctl is-active --quiet caddy; then
+        echo "✗ Caddy service failed to start"
+        echo
+        systemctl --no-pager --full status caddy || true
+        echo
+        journalctl -u caddy -n 50 --no-pager || true
+        return 1
+    fi
+
+    echo "✓ Caddy installed successfully"
+    echo "  Version: $(caddy version)"
 }
 
 
