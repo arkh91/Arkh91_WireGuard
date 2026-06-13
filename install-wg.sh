@@ -320,7 +320,12 @@ step_generate_token() {
 step_write_server_js() {
     echo "→ Writing Node.js API code..."
 
-    SERVER_PUBLIC_KEY=$(cat /etc/wireguard/server_public.key)
+    if [ -f "/etc/wireguard/server_public.key" ]; then
+        SERVER_PUBLIC_KEY=$(cat /etc/wireguard/server_public.key)
+    else
+        echo "⚠️  Warning: server_public.key not found."
+        SERVER_PUBLIC_KEY="MISSING"
+    fi
 
     cat > "$API_DIR/server.js" <<EOF
 const express = require('express');
@@ -330,152 +335,87 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 
 const app = express();
-
 app.use(helmet());
 app.use(express.json());
-
-app.use(rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 60,
-    message: { error: 'Too many requests, try again later.' }
-}));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 60, message: { error: 'Too many requests' } }));
 
 const API_TOKEN = '${API_TOKEN}';
 
 app.use((req, res, next) => {
     const auth = req.headers.authorization;
-
     if (!auth || auth !== 'Bearer ' + API_TOKEN) {
-        return res.status(401).json({
-            error: 'Unauthorized – invalid or missing token'
-        });
+        return res.status(401).json({ error: 'Unauthorized' });
     }
-
     next();
 });
 
 const WG_INTERFACE = '${WG_INTERFACE}';
-const WG_CONFIG = '${WG_CONFIG}';
-const SERVER_ENDPOINT = '${DOMAIN}';
-const SERVER_PUBLIC_KEY = '${SERVER_PUBLIC_KEY}';
-const WG_PORT = ${WG_PORT};
-const BASE_IP = '10.66.66.';
+const WG_CONFIG    = '${WG_CONFIG}';
+const SERVER_PUB   = '${SERVER_PUBLIC_KEY}';
+const ENDPOINT     = '${DOMAIN}';
+const WG_PORT      = ${WG_PORT};
+const BASE_IP      = '10.66.66.';
 
 function getNextIP() {
     const config = fs.readFileSync(WG_CONFIG, 'utf8');
-
     const matches = config.match(/10\\.66\\.66\\.(\\d+)/g) || [];
-
-    const usedIPs = matches.map(ip =>
-        parseInt(ip.split('.').pop(), 10)
-    );
-
+    const used = matches.map(ip => parseInt(ip.split('.').pop(), 10));
     for (let i = 2; i <= 254; i++) {
-        if (!usedIPs.includes(i)) {
-            return BASE_IP + i;
-        }
+        if (!used.includes(i)) return BASE_IP + i;
     }
-
     throw new Error('IP pool exhausted');
 }
 
 app.post('/create', (req, res) => {
     try {
+        const privateKey = execSync('wg genkey').toString().trim();
+        const publicKey  = execSync('echo "' + privateKey + '" | wg pubkey').toString().trim();
+        const clientIP   = getNextIP();
 
-        const privateKey = execSync('wg genkey')
-            .toString()
-            .trim();
-
-        const publicKey = execSync(
-            'echo "' + privateKey + '" | wg pubkey'
-        )
-            .toString()
-            .trim();
-
-        const clientIP = getNextIP();
-
-        const peerBlock =
-'\\n[Peer]\\n' +
-'PublicKey = ' + publicKey + '\\n' +
-'AllowedIPs = ' + clientIP + '/32\\n';
-
-        fs.appendFileSync(WG_CONFIG, peerBlock);
-
-        execSync(
-            'sudo /usr/local/bin/wg-provision "' +
-            publicKey +
-            '" "' +
-            clientIP +
-            '"'
+        fs.appendFileSync(WG_CONFIG,
+            '\\n[Peer]\\nPublicKey = ' + publicKey +
+            '\\nAllowedIPs = ' + clientIP + '/32\\n'
         );
 
-        const clientConfig =
-'[Interface]\\n' +
-'PrivateKey = ' + privateKey + '\\n' +
-'Address = ' + clientIP + '/32\\n' +
-'DNS = 1.1.1.1\\n\\n' +
-'[Peer]\\n' +
-'PublicKey = ' + SERVER_PUBLIC_KEY + '\\n' +
-'Endpoint = ' + SERVER_ENDPOINT + ':' + WG_PORT + '\\n' +
-'AllowedIPs = 0.0.0.0/0\\n' +
-'PersistentKeepalive = 25';
+        execSync('sudo /usr/local/bin/wg-provision "' + publicKey + '" "' + clientIP + '"');
 
-        res.json({
-            success: true,
-            config: clientConfig
-        });
+        const cfg =
+            '[Interface]\\n' +
+            'PrivateKey = ' + privateKey + '\\n' +
+            'Address = ' + clientIP + '/32\\n' +
+            'DNS = 1.1.1.1\\n\\n' +
+            '[Peer]\\n' +
+            'PublicKey = ' + SERVER_PUB + '\\n' +
+            'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\\n' +
+            'AllowedIPs = 0.0.0.0/0\\n' +
+            'PersistentKeepalive = 25';
 
+        res.json({ success: true, config: cfg });
     } catch (err) {
         console.error(err);
-
-        res.status(500).json({
-            error: err.message
-        });
+        res.status(500).json({ error: err.message });
     }
 });
 
 app.post('/remove', (req, res) => {
-
     const { publicKey } = req.body;
-
-    if (!publicKey) {
-        return res.status(400).json({
-            error: 'publicKey required'
-        });
-    }
-
+    if (!publicKey) return res.status(400).json({ error: 'publicKey required' });
     try {
-
-        execSync(
-            'sudo /usr/local/bin/wg-remove "' +
-            publicKey +
-            '"'
-        );
-
-        res.json({
-            success: true
-        });
-
+        execSync('sudo /usr/local/bin/wg-remove "' + publicKey + '"');
+        res.json({ success: true });
     } catch (err) {
-
         console.error(err);
-
-        res.status(500).json({
-            error: err.message
-        });
+        res.status(500).json({ error: err.message });
     }
 });
 
 app.listen(${API_PORT_INTERNAL}, '127.0.0.1', () => {
-    console.log(
-        'Secure API listening on localhost:${API_PORT_INTERNAL}'
-    );
+    console.log('API listening on localhost:${API_PORT_INTERNAL}');
 });
 EOF
 
     chown -R wgapi:wgapi "$API_DIR"
-
-    echo "✓ server.js written successfully"
+    echo "✓ server.js written"
 }
 
 print_success_message() {
