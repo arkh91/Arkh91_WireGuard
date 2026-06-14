@@ -91,22 +91,24 @@ step_install_caddy() {
                 curl \
                 gnupg
 
-            mkdir -p /usr/share/keyrings
+            # Add Caddy repository if not already configured
+            if [ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]; then
+                curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+                    | gpg --dearmor \
+                    -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+            fi
 
-            curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
-                | gpg --dearmor \
-                -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-
-            curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
-                -o /etc/apt/sources.list.d/caddy-stable.list
+            if [ ! -f /etc/apt/sources.list.d/caddy-stable.list ]; then
+                curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb \
+                    -o /etc/apt/sources.list.d/caddy-stable.list
+            fi
 
             apt update
             apt install -y caddy
             ;;
 
         rocky|almalinux|rhel|centos)
-            dnf install -y 'dnf-command(copr)'
-            dnf copr enable -y @caddy/caddy
+            dnf install -y epel-release
             dnf install -y caddy
             ;;
 
@@ -121,6 +123,10 @@ step_install_caddy() {
         opensuse-leap|opensuse-tumbleweed|opensuse)
             zypper --non-interactive refresh
             zypper --non-interactive install caddy
+            ;;
+
+        alpine)
+            apk add --no-cache caddy
             ;;
 
         *)
@@ -157,9 +163,6 @@ step_install_caddy() {
     echo "✓ Caddy installed successfully"
     echo "  Version: $(caddy version)"
 }
-
-
-
 step_wireguard_keys_config() {
     echo "→ Generating WireGuard server keys and base config..."
 
