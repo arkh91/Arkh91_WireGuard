@@ -317,6 +317,56 @@ EOF
     chmod 440 /etc/sudoers.d/wgapi
 }
 
+step_fix_permissions() {
+    echo "→ Fixing WireGuard permissions for API access..."
+    
+    # Add sudo permissions for file operations
+    cat >> /etc/sudoers.d/wgapi << 'EOF'
+
+# Allow wgapi to read/write WireGuard config file
+wgapi ALL=(root) NOPASSWD: /usr/bin/cat /etc/wireguard/wg0.conf
+wgapi ALL=(root) NOPASSWD: /usr/bin/tee -a /etc/wireguard/wg0.conf
+wgapi ALL=(root) NOPASSWD: /usr/bin/chmod 600 /etc/wireguard/wg0.conf
+EOF
+
+    # Fix sudoers file permissions
+    chmod 440 /etc/sudoers.d/wgapi
+    
+    # Create a wrapper script for safe config operations
+    cat > /usr/local/bin/wg-config-helper << 'EOF'
+#!/bin/bash
+# Helper script to safely read/write WireGuard config
+
+case "$1" in
+    read)
+        sudo cat /etc/wireguard/wg0.conf
+        ;;
+    append)
+        shift
+        echo "$*" | sudo tee -a /etc/wireguard/wg0.conf > /dev/null
+        ;;
+    *)
+        echo "Usage: wg-config-helper {read|append} [content]"
+        exit 1
+        ;;
+esac
+EOF
+
+    chmod +x /usr/local/bin/wg-config-helper
+    
+    # Add sudo permission for the helper script
+    echo "wgapi ALL=(root) NOPASSWD: /usr/local/bin/wg-config-helper" >> /etc/sudoers.d/wgapi
+    
+    # Test permissions
+    if sudo -u wgapi sudo cat /etc/wireguard/wg0.conf &>/dev/null; then
+        echo "✓ wgapi can read WireGuard config"
+    else
+        echo "⚠️  Warning: wgapi cannot read config directly, will use helper"
+    fi
+    
+    echo "✓ Permissions configured successfully"
+}
+
 step_api_npm_setup() {
     echo "→ Preparing API directory and npm dependencies..."
     mkdir -p "$API_DIR"
@@ -364,15 +414,35 @@ app.use((req, res, next) => {
     next();
 });
 
-const WG_INTERFACE = '${WG_INTERFACE}';
-const WG_CONFIG    = '${WG_CONFIG}';
-const SERVER_PUB   = '${SERVER_PUBLIC_KEY}';
-const ENDPOINT     = '${DOMAIN}';
-const WG_PORT      = ${WG_PORT};
-const BASE_IP      = '10.66.66.';
+const WG_CONFIG = '${WG_CONFIG}';
+const SERVER_PUB = '${SERVER_PUBLIC_KEY}';
+const ENDPOINT = '${DOMAIN}';
+const WG_PORT = ${WG_PORT};
+const BASE_IP = '10.66.66.';
+
+// Helper function to read config using sudo
+function readConfig() {
+    try {
+        const result = execSync('sudo /usr/local/bin/wg-config-helper read', { encoding: 'utf8' });
+        return result;
+    } catch (err) {
+        console.error('Error reading config:', err.message);
+        throw new Error('Cannot read WireGuard configuration');
+    }
+}
+
+// Helper function to append to config using sudo
+function appendToConfig(content) {
+    try {
+        execSync(\`sudo /usr/local/bin/wg-config-helper append '\${content}'\`, { encoding: 'utf8' });
+    } catch (err) {
+        console.error('Error writing to config:', err.message);
+        throw new Error('Cannot write to WireGuard configuration');
+    }
+}
 
 function getNextIP() {
-    const config = fs.readFileSync(WG_CONFIG, 'utf8');
+    const config = readConfig();
     const matches = config.match(/10\\.66\\.66\\.(\\d+)/g) || [];
     const used = matches.map(ip => parseInt(ip.split('.').pop(), 10));
     for (let i = 2; i <= 254; i++) {
@@ -387,21 +457,19 @@ app.post('/create', (req, res) => {
         const publicKey = execSync('wg pubkey', { input: privateKey, encoding: 'utf8' }).trim();
         const clientIP = getNextIP();
 
-        fs.appendFileSync(WG_CONFIG,
-            '\n[Peer]\nPublicKey = ' + publicKey +
-            '\nAllowedIPs = ' + clientIP + '/32\n'
-        );
+        const peerConfig = \`\n[Peer]\nPublicKey = \${publicKey}\nAllowedIPs = \${clientIP}/32\n\`;
+        appendToConfig(peerConfig);
 
-        execSync('sudo /usr/local/bin/wg-provision "' + publicKey + '" "' + clientIP + '"');
+        execSync(\`sudo /usr/local/bin/wg-provision "\${publicKey}" "\${clientIP}"\`);
 
         const cfg =
             '[Interface]\n' +
-            'PrivateKey = ' + privateKey + '\n' +
-            'Address = ' + clientIP + '/32\n' +
+            \`PrivateKey = \${privateKey}\n\` +
+            \`Address = \${clientIP}/32\n\` +
             'DNS = 1.1.1.1\n\n' +
             '[Peer]\n' +
-            'PublicKey = ' + SERVER_PUB + '\n' +
-            'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\n' +
+            \`PublicKey = \${SERVER_PUB}\n\` +
+            \`Endpoint = \${ENDPOINT}:\${WG_PORT}\n\` +
             'AllowedIPs = 0.0.0.0/0\n' +
             'PersistentKeepalive = 25';
 
@@ -416,12 +484,16 @@ app.post('/remove', (req, res) => {
     const { publicKey } = req.body;
     if (!publicKey) return res.status(400).json({ error: 'publicKey required' });
     try {
-        execSync('sudo /usr/local/bin/wg-remove "' + publicKey + '"');
+        execSync(\`sudo /usr/local/bin/wg-remove "\${publicKey}"\`);
         res.json({ success: true });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
     }
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 app.listen(${API_PORT_INTERNAL}, '127.0.0.1', () => {
@@ -431,33 +503,6 @@ EOF
 
     chown -R wgapi:wgapi "$API_DIR"
     echo "✓ server.js written"
-}
-step_create_systemd_service() {
-    echo "→ Creating systemd service for API..."
-    
-    cat > "/etc/systemd/system/${API_SERVICE}" << EOF
-[Unit]
-Description=WireGuard API Service
-After=network.target
-
-[Service]
-Type=simple
-User=wgapi
-Group=wgapi
-WorkingDirectory=${API_DIR}
-ExecStart=/usr/bin/node ${API_DIR}/server.js
-Restart=on-failure
-RestartSec=5
-Environment=NODE_ENV=production
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable "${API_SERVICE}"
-    systemctl start "${API_SERVICE}"
-    echo "✓ Systemd service created and started"
 }
 
 step_configure_caddy() {
@@ -535,7 +580,8 @@ install() {
     step_install_wg_provision
     step_install_wg_remove
     step_configure_sudoers
-
+    step_fix_permissions
+    
     step_api_npm_setup
     step_generate_token
     step_write_server_js
