@@ -420,6 +420,49 @@ EOF
     chown -R wgapi:wgapi "$API_DIR"
     echo "✓ server.js written"
 }
+step_create_systemd_service() {
+    echo "→ Creating systemd service for API..."
+    
+    cat > "/etc/systemd/system/${API_SERVICE}" << EOF
+[Unit]
+Description=WireGuard API Service
+After=network.target
+
+[Service]
+Type=simple
+User=wgapi
+Group=wgapi
+WorkingDirectory=${API_DIR}
+ExecStart=/usr/bin/node ${API_DIR}/server.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "${API_SERVICE}"
+    systemctl start "${API_SERVICE}"
+    echo "✓ Systemd service created and started"
+}
+
+step_configure_caddy() {
+    echo "→ Configuring Caddy reverse proxy..."
+    
+    cat > /etc/caddy/Caddyfile << EOF
+${DOMAIN} {
+    reverse_proxy localhost:${API_PORT_INTERNAL}
+    log {
+        output file /var/log/caddy/wg-api.log
+    }
+}
+EOF
+
+    systemctl restart caddy
+    echo "✓ Caddy configured"
+}
 
 print_success_message() {
     echo ""
