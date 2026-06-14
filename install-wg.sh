@@ -371,26 +371,26 @@ function getNextIP() {
 
 app.post('/create', (req, res) => {
     try {
-        const privateKey = execSync('wg genkey').toString().trim();
-        const publicKey  = execSync('echo "' + privateKey + '" | wg pubkey').toString().trim();
-        const clientIP   = getNextIP();
+        const privateKey = execSync('wg genkey', { encoding: 'utf8' }).trim();
+        const publicKey = execSync('wg pubkey', { input: privateKey, encoding: 'utf8' }).trim();
+        const clientIP = getNextIP();
 
         fs.appendFileSync(WG_CONFIG,
-            '\\n[Peer]\\nPublicKey = ' + publicKey +
-            '\\nAllowedIPs = ' + clientIP + '/32\\n'
+            '\n[Peer]\nPublicKey = ' + publicKey +
+            '\nAllowedIPs = ' + clientIP + '/32\n'
         );
 
         execSync('sudo /usr/local/bin/wg-provision "' + publicKey + '" "' + clientIP + '"');
 
         const cfg =
-            '[Interface]\\n' +
-            'PrivateKey = ' + privateKey + '\\n' +
-            'Address = ' + clientIP + '/32\\n' +
-            'DNS = 1.1.1.1\\n\\n' +
-            '[Peer]\\n' +
-            'PublicKey = ' + SERVER_PUB + '\\n' +
-            'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\\n' +
-            'AllowedIPs = 0.0.0.0/0\\n' +
+            '[Interface]\n' +
+            'PrivateKey = ' + privateKey + '\n' +
+            'Address = ' + clientIP + '/32\n' +
+            'DNS = 1.1.1.1\n\n' +
+            '[Peer]\n' +
+            'PublicKey = ' + SERVER_PUB + '\n' +
+            'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\n' +
+            'AllowedIPs = 0.0.0.0/0\n' +
             'PersistentKeepalive = 25';
 
         res.json({ success: true, config: cfg });
