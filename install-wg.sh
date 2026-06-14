@@ -66,7 +66,8 @@ step_install_packages() {
         curl \
         openssl \
         gnupg \
-        sudo
+        sudo \
+        jq
 }
 
 step_install_caddy() {
