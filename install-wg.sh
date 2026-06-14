@@ -398,16 +398,33 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const { execSync } = require('child_process');
-const fs = require('fs');
 
 const app = express();
+
+// Trust proxy (Caddy is our reverse proxy) - IMPORTANT FIX
+app.set('trust proxy', true);
+
 app.use(helmet());
 app.use(express.json());
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 60, message: { error: 'Too many requests' } }));
+
+// Rate limiter with proxy support
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    message: { error: 'Too many requests' },
+    validate: { xForwardedForHeader: false }  // Disable validation warning
+});
+app.use(limiter);
 
 const API_TOKEN = '${API_TOKEN}';
 
+// Authentication middleware (excludes health endpoint)
 app.use((req, res, next) => {
+    // Skip auth for health endpoint
+    if (req.path === '/health') {
+        return next();
+    }
+    
     const auth = req.headers.authorization;
     if (!auth || auth !== 'Bearer ' + API_TOKEN) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -506,22 +523,6 @@ EOF
     echo "✓ server.js written"
 }
 
-step_configure_caddy() {
-    echo "→ Configuring Caddy reverse proxy..."
-    
-    cat > /etc/caddy/Caddyfile << EOF
-${DOMAIN} {
-    reverse_proxy localhost:${API_PORT_INTERNAL}
-    log {
-        output file /var/log/caddy/wg-api.log
-    }
-}
-EOF
-
-    systemctl restart caddy
-    echo "✓ Caddy configured"
-}
-
 ########Function step_create_systemd_service########
 step_create_systemd_service() {
     echo "→ Creating systemd service for API..."
@@ -611,7 +612,7 @@ install() {
     ask_domain
 
     step_install_packages
-    echo "Instaling Packages Done..."
+    echo "Installing Packages Done..."
     step_install_caddy
     echo "Install Caddy Done..."
     step_wireguard_keys_config
@@ -619,7 +620,7 @@ install() {
     step_enable_ip_forward
     echo "Enable IP forward Done..."
     step_firewall_rules
-    echo "forewall rules Done..."
+    echo "firewall rules Done..."
     step_start_wireguard
     step_create_api_user
 
@@ -631,8 +632,8 @@ install() {
     step_api_npm_setup
     step_generate_token
     step_write_server_js
-    step_create_systemd_service
-    step_configure_caddy
+    step_create_systemd_service    # ← MUST be before configure_caddy
+    step_configure_caddy            # ← ONLY ONCE
     print_success_message
 
     echo "Done."
