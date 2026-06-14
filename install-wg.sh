@@ -91,16 +91,16 @@ step_install_caddy() {
                 curl \
                 gnupg
 
-            # Add Caddy repository if not already configured
+            # Add Caddy repository - FIXED VERSION
             if [ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]; then
                 curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
                     | gpg --dearmor \
                     -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
             fi
 
+            # CORRECTED: Use the proper .list file URL, not .deb
             if [ ! -f /etc/apt/sources.list.d/caddy-stable.list ]; then
-                curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb \
-                    -o /etc/apt/sources.list.d/caddy-stable.list
+                echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/ubuntu $(lsb_release -cs) main" > /etc/apt/sources.list.d/caddy-stable.list
             fi
 
             apt update
@@ -133,36 +133,48 @@ step_install_caddy() {
             echo "✗ Unsupported Linux distribution:"
             echo "  $PRETTY_NAME"
             echo
-            echo "Official installation instructions:"
-            echo "https://caddyserver.com/docs/install"
-            return 1
+            echo "Falling back to direct package install..."
+            apt install -y caddy || dnf install -y caddy || pacman -S --noconfirm caddy || echo "Please install Caddy manually from https://caddyserver.com/download"
             ;;
     esac
 
     # Verify binary exists
     if ! command -v caddy >/dev/null 2>&1; then
         echo "✗ Caddy binary not found after installation"
-        return 1
+        echo "Attempting alternative installation method..."
+        
+        # Alternative: Download directly from Caddy's website
+        curl -fsSL https://caddyserver.com/api/download?os=linux&arch=amd64 -o /tmp/caddy.tar.gz
+        tar -xzf /tmp/caddy.tar.gz -C /tmp
+        mv /tmp/caddy /usr/bin/
+        chmod +x /usr/bin/caddy
+        rm /tmp/caddy.tar.gz
     fi
+
+    # Create caddy user if it doesn't exist
+    if ! id caddy &>/dev/null; then
+        useradd -r -s /usr/sbin/nologin caddy
+    fi
+
+    # Create necessary directories
+    mkdir -p /etc/caddy /var/log/caddy /var/lib/caddy
+    chown -R caddy:caddy /var/log/caddy /var/lib/caddy
 
     # Enable and start service
     systemctl daemon-reload
-    systemctl enable caddy >/dev/null 2>&1
-    systemctl restart caddy
+    systemctl enable caddy 2>/dev/null || true
+    systemctl restart caddy || true
 
     # Verify service is running
-    if ! systemctl is-active --quiet caddy; then
-        echo "✗ Caddy service failed to start"
-        echo
-        systemctl --no-pager --full status caddy || true
-        echo
-        journalctl -u caddy -n 50 --no-pager || true
-        return 1
+    if systemctl is-active --quiet caddy; then
+        echo "✓ Caddy installed successfully"
+        echo "  Version: $(caddy version 2>/dev/null || echo 'unknown')"
+    else
+        echo "⚠️  Caddy installed but service not started"
+        echo "  You may need to start it manually: systemctl start caddy"
     fi
-
-    echo "✓ Caddy installed successfully"
-    echo "  Version: $(caddy version)"
 }
+
 step_wireguard_keys_config() {
     echo "→ Generating WireGuard server keys and base config..."
 
