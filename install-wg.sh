@@ -383,6 +383,7 @@ step_generate_token() {
     echo "→ Generated Bearer token: $API_TOKEN"
 }
 
+######step_write_server_js #####
 step_write_server_js() {
     echo "→ Writing Node.js API code..."
 
@@ -401,7 +402,7 @@ const { execSync } = require('child_process');
 
 const app = express();
 
-// Trust proxy (Caddy is our reverse proxy) - IMPORTANT FIX
+// Trust proxy (Caddy is our reverse proxy)
 app.set('trust proxy', true);
 
 app.use(helmet());
@@ -411,8 +412,8 @@ app.use(express.json());
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 60,
-    message: { error: 'Too many requests' },
-    validate: { xForwardedForHeader: false }  // Disable validation warning
+    message: 'Too many requests, please try again later.',
+    validate: { xForwardedForHeader: false }
 });
 app.use(limiter);
 
@@ -480,18 +481,22 @@ app.post('/create', (req, res) => {
 
         execSync(\`sudo /usr/local/bin/wg-provision "\${publicKey}" "\${clientIP}"\`);
 
-        const cfg =
-            '[Interface]\n' +
-            \`PrivateKey = \${privateKey}\n\` +
-            \`Address = \${clientIP}/32\n\` +
-            'DNS = 1.1.1.1\n\n' +
-            '[Peer]\n' +
-            \`PublicKey = \${SERVER_PUB}\n\` +
-            \`Endpoint = \${ENDPOINT}:\${WG_PORT}\n\` +
-            'AllowedIPs = 0.0.0.0/0\n' +
+        // Build the config as plain text
+        const cfg = 
+            '[Interface]\\n' +
+            'PrivateKey = ' + privateKey + '\\n' +
+            'Address = ' + clientIP + '/32\\n' +
+            'DNS = 1.1.1.1\\n' +
+            '\\n' +
+            '[Peer]\\n' +
+            'PublicKey = ' + SERVER_PUB + '\\n' +
+            'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\\n' +
+            'AllowedIPs = 0.0.0.0/0\\n' +
             'PersistentKeepalive = 25';
 
-        res.json({ success: true, config: cfg });
+        // Return plain text config instead of JSON
+        res.setHeader('Content-Type', 'text/plain');
+        res.send(cfg);
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
