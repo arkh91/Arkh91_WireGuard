@@ -16,11 +16,9 @@ CREATE TABLE wg_clients (
     status TINYINT UNSIGNED NOT NULL DEFAULT 1,
 
     -- 1 = Active
-    -- 2 = Disabled
-    -- 3 = Expired
-    -- 4 = Suspended
-    -- 5 = Pending
-    -- 6 = Deleted
+    -- 2 = Expired
+    -- 3 = Suspended
+    -- 4 = Deleted
 
     -- timestamps
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
