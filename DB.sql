@@ -6,37 +6,44 @@ CREATE TABLE wg_clients (
 
     -- wireguard config
     private_key TEXT NOT NULL,
-    public_key TEXT NOT NULL,
-    address VARCHAR(45) NOT NULL,
-    dns VARCHAR(100),
-    allowed_ips VARCHAR(100),
+    public_key VARCHAR(44) NOT NULL UNIQUE,
+    address VARCHAR(45) NOT NULL UNIQUE,
+    dns VARCHAR(255),
+    allowed_ips VARCHAR(255),
     endpoint VARCHAR(255),
 
-    status TINYINT(1) DEFAULT 1,
+    -- status
+    status TINYINT UNSIGNED NOT NULL DEFAULT 1,
 
-    --1 = Active
-    --2 = Disabled
-    --3 = Expired
-    --4 = Suspended
-    --5 = Pending
-    --6 = Deleted
+    -- 1 = Active
+    -- 2 = Disabled
+    -- 3 = Expired
+    -- 4 = Suspended
+    -- 5 = Pending
+    -- 6 = Deleted
 
     -- timestamps
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, -- DB updated
-    last_seen DATETIME NULL, --when client was active
-    last_handshake DATETIME, --Latest WireGuard handshake
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    last_seen DATETIME NULL,
+    last_handshake DATETIME NULL,
 
-    -- ===== TRAFFIC TOTALS (PERSISTENT) =====
-    rx_bytes BIGINT UNSIGNED DEFAULT 0,
-    tx_bytes BIGINT UNSIGNED DEFAULT 0,
-    total_bytes BIGINT UNSIGNED GENERATED ALWAYS AS (rx_bytes + tx_bytes) STORED,
+    -- persistent traffic totals
+    rx_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    tx_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    total_bytes BIGINT UNSIGNED
+        GENERATED ALWAYS AS (rx_bytes + tx_bytes) STORED,
 
-    -- ===== SNAPSHOT FOR DELTA CALCULATION =====
-    last_rx_snapshot BIGINT UNSIGNED DEFAULT 0,
-    last_tx_snapshot BIGINT UNSIGNED DEFAULT 0,
+    -- snapshot values from latest wg poll
+    last_rx_snapshot BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    last_tx_snapshot BIGINT UNSIGNED NOT NULL DEFAULT 0,
 
-    -- ===== OPTIONAL LIMIT CONTROL =====
-    max_data_limit BIGINT UNSIGNED DEFAULT NULL,
-    speed_limit_kbps INT DEFAULT NULL
+    -- limits
+    max_data_limit BIGINT UNSIGNED NULL,
+    speed_limit_kbps INT UNSIGNED NULL,
+
+    INDEX idx_status (status),
+    INDEX idx_last_seen (last_seen),
+    INDEX idx_last_handshake (last_handshake)
 );
