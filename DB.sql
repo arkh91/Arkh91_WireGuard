@@ -12,13 +12,20 @@ CREATE TABLE wg_clients (
     allowed_ips VARCHAR(100),
     endpoint VARCHAR(255),
 
-    -- status (replaces "blocked")
-    active TINYINT(1) DEFAULT 1,
+    status TINYINT(1) DEFAULT 1,
+
+    --1 = Active
+    --2 = Disabled
+    --3 = Expired
+    --4 = Suspended
+    --5 = Pending
+    --6 = Deleted
 
     -- timestamps
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    last_seen DATETIME NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, -- DB updated
+    last_seen DATETIME NULL, --when client was active
+    last_handshake DATETIME, --Latest WireGuard handshake
 
     -- ===== TRAFFIC TOTALS (PERSISTENT) =====
     rx_bytes BIGINT UNSIGNED DEFAULT 0,
