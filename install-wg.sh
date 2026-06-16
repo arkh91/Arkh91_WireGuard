@@ -649,32 +649,245 @@ install() {
 # ────────────────────────────────────────────────
 
 uninstall() {
-    echo "Uninstalling WireGuard + Secure API setup..."
+echo ""
+echo "════════════════════════════════════════════════════"
+echo "         WireGuard + API Full Uninstaller"
+echo "════════════════════════════════════════════════════"
+echo ""
+echo "⚠️  This will remove:"
+echo "   • WireGuard interface & config"
+echo "   • Node.js API service & files"
+echo "   • Caddy web server & config"
+echo "   • iptables rules"
+echo "   • sudoers entries"
+echo "   • wgapi system user"
+echo "   • Helper scripts"
+echo "   • Installed packages (optional)"
+echo ""
 
-    systemctl stop wg-quick@"$WG_INTERFACE"     2>/dev/null || true
-    systemctl disable wg-quick@"$WG_INTERFACE"  2>/dev/null || true
-    systemctl stop "$API_SERVICE"               2>/dev/null || true
-    systemctl disable "$API_SERVICE"            2>/dev/null || true
-    systemctl stop caddy                        2>/dev/null || true
-
-    rm -f "/etc/systemd/system/$API_SERVICE"
-    rm -rf "$API_DIR"
-    rm -f "$WG_CONFIG"
-    rm -f /etc/caddy/Caddyfile
-
-    iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT                       2>/dev/null || true
-    iptables -D FORWARD -i "$WG_INTERFACE" -j ACCEPT                            2>/dev/null || true
-    iptables -D FORWARD -o "$WG_INTERFACE" -j ACCEPT                            2>/dev/null || true
-    iptables -t nat -D POSTROUTING -s "$WG_NETWORK" -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null || true
-
-    netfilter-persistent save 2>/dev/null || true
-    systemctl daemon-reload
-
-    echo ""
-    echo "Uninstall finished."
-    echo "Packages (caddy, wireguard, nodejs, npm, iptables-persistent) still installed."
-    echo "Remove them manually if you want: apt remove ..."
+```
+read -r -p "Are you sure? Type 'yes' to confirm: " confirm
+[[ "$confirm" != "yes" ]] && {
+    echo "Aborted."
+    return 0
 }
+
+detect_outbound_interface
+
+echo ""
+echo "Detected:"
+echo "  Interface : $WG_INTERFACE"
+echo "  Config    : $WG_CONFIG"
+echo "  API Dir   : $API_DIR"
+echo "  WG Port   : $WG_PORT"
+echo "  Outbound  : $OUT_IFACE"
+echo ""
+
+# ─────────────────────────────────────────────
+# 1. Stop services
+# ─────────────────────────────────────────────
+echo "→ [1/10] Stopping services..."
+
+for svc in "wg-quick@${WG_INTERFACE}" "${API_SERVICE}" caddy; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}"; then
+
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" || true
+            echo "  ✓ Stopped $svc"
+        fi
+
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            systemctl disable "$svc" || true
+            echo "  ✓ Disabled $svc"
+        fi
+    fi
+done
+
+# ─────────────────────────────────────────────
+# 2. Remove WireGuard interface
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [2/10] Removing WireGuard interface..."
+
+wg-quick down "$WG_INTERFACE" 2>/dev/null || true
+
+if ip link show "$WG_INTERFACE" &>/dev/null; then
+    ip link delete "$WG_INTERFACE" 2>/dev/null || true
+fi
+
+echo "  ✓ Interface cleanup complete"
+
+# ─────────────────────────────────────────────
+# 3. Remove iptables rules
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [3/10] Removing iptables rules..."
+
+while iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null; do
+    echo "  ✓ Removed INPUT rule"
+done
+
+while iptables -D FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null; do
+    echo "  ✓ Removed FORWARD inbound rule"
+done
+
+while iptables -D FORWARD -o "$WG_INTERFACE" -j ACCEPT 2>/dev/null; do
+    echo "  ✓ Removed FORWARD outbound rule"
+done
+
+while iptables -t nat -D POSTROUTING -s "$WG_NETWORK" -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null; do
+    echo "  ✓ Removed MASQUERADE rule"
+done
+
+netfilter-persistent save 2>/dev/null || true
+
+# ─────────────────────────────────────────────
+# 4. Remove systemd units
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [4/10] Removing systemd units..."
+
+rm -f "/etc/systemd/system/${API_SERVICE}"
+rm -rf "/etc/systemd/system/${API_SERVICE}.d"
+
+systemctl daemon-reload
+
+echo "  ✓ Removed API service units"
+
+# ─────────────────────────────────────────────
+# 5. Remove configuration files
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [5/10] Removing configuration files..."
+
+rm -f "$WG_CONFIG"
+rm -f /etc/wireguard/server_private.key
+rm -f /etc/wireguard/server_public.key
+
+rmdir /etc/wireguard 2>/dev/null || true
+
+rm -f /etc/caddy/Caddyfile
+rm -rf /etc/caddy
+rm -rf /var/lib/caddy
+rm -rf /var/log/caddy
+
+rm -rf "$API_DIR"
+
+echo "  ✓ Configuration files removed"
+
+# ─────────────────────────────────────────────
+# 6. Remove helper scripts
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [6/10] Removing helper scripts..."
+
+rm -f /usr/local/bin/wg-provision
+rm -f /usr/local/bin/wg-remove
+rm -f /usr/local/bin/wg-config-helper
+
+echo "  ✓ Helper scripts removed"
+
+# ─────────────────────────────────────────────
+# 7. Remove sudoers entries
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [7/10] Removing sudoers entries..."
+
+rm -f /etc/sudoers.d/wgapi
+
+echo "  ✓ Removed sudoers configuration"
+
+# ─────────────────────────────────────────────
+# 8. Remove system user
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [8/10] Removing wgapi user..."
+
+if id wgapi &>/dev/null; then
+    userdel -r wgapi 2>/dev/null || userdel wgapi 2>/dev/null || true
+    echo "  ✓ Removed user wgapi"
+else
+    echo "  ↷ User wgapi not found"
+fi
+
+# ─────────────────────────────────────────────
+# 9. Remove packages
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [9/10] Package cleanup..."
+
+PACKAGES=(
+    wireguard
+    wireguard-tools
+    caddy
+    nodejs
+    npm
+    iptables-persistent
+    netfilter-persistent
+)
+
+echo ""
+echo "Packages that may be removed:"
+printf '  • %s\n' "${PACKAGES[@]}"
+echo ""
+
+read -r -p "Remove these packages? [y/N]: " rm_pkgs
+
+if [[ "$rm_pkgs" =~ ^[Yy]$ ]]; then
+
+    apt remove --purge -y "${PACKAGES[@]}" || true
+    apt autoremove -y || true
+    apt autoclean -y || true
+
+    rm -f /etc/apt/sources.list.d/caddy-stable.list
+    rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+    apt update -y || true
+
+    echo "  ✓ Packages removed"
+else
+    echo "  ↷ Package removal skipped"
+fi
+
+# ─────────────────────────────────────────────
+# 10. Revert IP forwarding
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [10/10] IP forwarding..."
+
+read -r -p "Disable IPv4 forwarding? [y/N]: " revert_fwd
+
+if [[ "$revert_fwd" =~ ^[Yy]$ ]]; then
+
+    sysctl -w net.ipv4.ip_forward=0 >/dev/null
+
+    if [ -f /etc/sysctl.conf ]; then
+        sed -i '/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=/d' /etc/sysctl.conf
+        echo "net.ipv4.ip_forward=0" >> /etc/sysctl.conf
+    fi
+
+    sysctl -p >/dev/null 2>&1 || true
+
+    echo "  ✓ IP forwarding disabled"
+else
+    echo "  ↷ IP forwarding unchanged"
+fi
+
+echo ""
+echo "════════════════════════════════════════════════════"
+echo "              Uninstall Complete ✓"
+echo "════════════════════════════════════════════════════"
+echo ""
+echo "All WireGuard/API components installed by this"
+echo "script have been removed."
+echo ""
+echo "A reboot is recommended if you want to ensure"
+echo "the WireGuard kernel module is fully unloaded."
+echo ""
+```
+
+}
+
 
 # ────────────────────────────────────────────────
 # CLI argument parsing
