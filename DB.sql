@@ -1,3 +1,13 @@
+
+CREATE TABLE accounts (
+    UserID INT PRIMARY KEY,  -- Telegram ID
+    FirstName VARCHAR(50),
+    LastName VARCHAR(50),
+    Username VARCHAR(50),
+    CurrentBalance DECIMAL(10,2) DEFAULT 0.00,
+    CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE wg_clients (
 
     -- Unique client record ID
