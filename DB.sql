@@ -3,6 +3,9 @@ CREATE TABLE wg_clients (
     -- Unique client record ID
     client_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 
+    -- Owner account (Telegram / website / admin) - optional
+    UserID BIGINT UNSIGNED NULL,
+
     -- Human-readable client name
     name VARCHAR(100) NOT NULL,
 
@@ -49,9 +52,6 @@ CREATE TABLE wg_clients (
     updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
         ON UPDATE CURRENT_TIMESTAMP(3),
 
-    -- Last detected client activity
-    last_seen DATETIME(3) NULL,
-
     -- Last successful WireGuard handshake
     last_handshake DATETIME(3) NULL,
 
@@ -91,29 +91,14 @@ CREATE TABLE wg_clients (
     -- Internal notes
     notes TEXT NULL,
 
-    -- Lookup clients by server
+    -- Fast lookup by owner (Telegram/website/admin)
+    INDEX idx_user (UserID),
+
+    -- Fast lookup user keys per server
+    INDEX idx_user_server (UserID, server_name),
+
+    -- Fast lookup clients by server
     INDEX idx_server (server_name),
-
-    -- Lookup active clients
-    INDEX idx_active (is_active),
-
-    -- Lookup by status flags
-    INDEX idx_status (is_expired, is_suspended, is_deleted),
-
-    -- Lookup by activity timestamp
-    INDEX idx_last_seen (last_seen),
-
-    -- Lookup by handshake timestamp
-    INDEX idx_last_handshake (last_handshake),
-
-    -- Lookup expiring/expired clients
-    INDEX idx_expires (expires_at),
-
-    -- Lookup stale collectors
-    INDEX idx_last_poll (last_poll_at),
-
-    -- Sort/filter by total traffic usage
-    INDEX idx_traffic (total_bytes),
 
     -- Fast lookup active clients per server
     INDEX idx_server_active (server_name, is_active),
@@ -125,7 +110,22 @@ CREATE TABLE wg_clients (
         is_expired,
         is_suspended,
         is_deleted
-    )
+    ),
+
+    -- Fast lookup expiring clients
+    INDEX idx_expires (expires_at),
+
+    -- Fast lookup handshake status
+    INDEX idx_last_handshake (last_handshake),
+
+    -- Monitor collector health
+    INDEX idx_last_poll (last_poll_at),
+
+    -- Foreign key (optional owner link)
+    CONSTRAINT fk_wg_clients_user
+        FOREIGN KEY (UserID)
+        REFERENCES accounts(UserID)
+        ON DELETE CASCADE
 
 ) ENGINE=InnoDB
 DEFAULT CHARSET=utf8mb4
