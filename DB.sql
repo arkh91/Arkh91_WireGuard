@@ -140,3 +140,42 @@ CREATE TABLE wg_clients (
 ) ENGINE=InnoDB
 DEFAULT CHARSET=utf8mb4
 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE vpn_servers (
+    ServerID INT AUTO_INCREMENT PRIMARY KEY,
+
+    ServerName VARCHAR(50) NOT NULL,     -- IR-Tehran-1, UK-London-1
+    Country VARCHAR(50) NOT NULL,
+    City VARCHAR(50) NOT NULL,
+
+    -- Routing endpoints
+    PublicURLInternational VARCHAR(255) NOT NULL,
+    PublicURLIran VARCHAR(255) NOT NULL,
+
+    -- Network ports (separated clearly)
+    WireGuardPort INT DEFAULT 51820,
+    OutlinePort INT DEFAULT NULL,
+
+    -- Server address
+    IPAddress VARCHAR(45),
+
+    -- Security
+    APIKey VARCHAR(255),
+    BearerToken VARCHAR(255),
+
+    -- Capacity
+    MaxUsers INT DEFAULT 0,
+    CurrentUsers INT DEFAULT 0,
+
+    -- Operational state
+    Status ENUM('ACTIVE','INACTIVE','MAINTENANCE','FULL') DEFAULT 'ACTIVE',
+
+    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    -- Indexes
+    INDEX idx_country (Country),
+    INDEX idx_city (City),
+    INDEX idx_status (Status),
+    INDEX idx_status_country (Status, Country)
+);
