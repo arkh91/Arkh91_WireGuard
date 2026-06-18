@@ -179,3 +179,22 @@ CREATE TABLE vpn_servers (
     INDEX idx_status (Status),
     INDEX idx_status_country (Status, Country)
 );
+
+CREATE TABLE countries (
+    CountryID INT AUTO_INCREMENT PRIMARY KEY,
+
+    CountryName VARCHAR(100) NOT NULL,
+
+    CountryCode CHAR(2) NOT NULL UNIQUE,   -- US, IR, DE
+
+    FlagEmoji VARCHAR(10),
+    FlagURL VARCHAR(255),
+
+    Continent VARCHAR(50),
+
+    IsActive BOOLEAN DEFAULT TRUE,
+
+    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_country_code (CountryCode)
+);
