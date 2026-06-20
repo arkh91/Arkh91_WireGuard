@@ -492,7 +492,7 @@ app.post('/create', (req, res) => {
             'PublicKey = ' + SERVER_PUB + '\\n' +
             'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\\n' +
             'AllowedIPs = 0.0.0.0/0\\n' +
-            'PersistentKeepalive = 25'\\n';
+            'PersistentKeepalive = 25' + '\n';
 
         // Return plain text config instead of JSON
         res.setHeader('Content-Type', 'text/plain');
