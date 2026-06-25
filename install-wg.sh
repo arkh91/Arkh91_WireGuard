@@ -56,18 +56,31 @@ ask_domain() {
 step_install_packages() {
     echo "→ Installing required packages..."
     apt update -y
-    #apt install -y wireguard iptables iptables-persistent nodejs npm curl openssl
+
     apt install -y \
         wireguard \
         iptables \
         iptables-persistent \
-        nodejs \
-        npm \
         curl \
         openssl \
         gnupg \
         sudo \
         jq
+
+    if ! command -v node >/dev/null 2>&1; then
+        echo "→ Node.js not found, installing NodeSource Node.js..."
+
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt install -y nodejs
+
+        echo "→ Node installed:"
+        node -v
+        npm -v
+    else
+        echo "→ Node.js already installed, skipping installation"
+        node -v
+        npm -v
+    fi
 }
 
 step_install_caddy() {
