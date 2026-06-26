@@ -6,5 +6,6 @@ Custom WireGuard
 
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg.sh)
 
+
 or with a custom port:
-./install-wg.sh --keys-port=11000
+bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install_wg_custom_port.sh)
