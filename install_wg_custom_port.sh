@@ -364,8 +364,7 @@ EOF
     # Fix sudoers file permissions
     chmod 440 /etc/sudoers.d/wgapi
 
-    # Create a wrapper script for safe config operations
-    cat > /usr/local/bin/wg-config-helper << 'EOF'
+   cat > /usr/local/bin/wg-config-helper << 'EOF'
 #!/bin/bash
 # Helper script to safely read/write WireGuard config
 
@@ -377,8 +376,16 @@ case "$1" in
         shift
         echo "$*" | sudo tee -a /etc/wireguard/wg0.conf > /dev/null
         ;;
+    append-file)
+        if [ -f "$2" ]; then
+            sudo cat "$2" | sudo tee -a /etc/wireguard/wg0.conf > /dev/null
+        else
+            echo "Error: File $2 not found"
+            exit 1
+        fi
+        ;;
     *)
-        echo "Usage: wg-config-helper {read|append} [content]"
+        echo "Usage: wg-config-helper {read|append|append-file} [content|file]"
         exit 1
         ;;
 esac
@@ -483,7 +490,15 @@ function readConfig() {
 // Helper function to append to config using sudo
 function appendToConfig(content) {
     try {
-        execSync(\`sudo /usr/local/bin/wg-config-helper append '\${content}'\`, { encoding: 'utf8' });
+        const tempFile = '/tmp/wg_append_temp';
+        require('fs').writeFileSync(tempFile, content);
+        execSync(`sudo /usr/local/bin/wg-config-helper append-file ${tempFile}`, { encoding: 'utf8' });
+        // Verify it was written
+        const newConfig = readConfig();
+        if (!newConfig.includes(content.trim())) {
+            throw new Error('Config append verification failed');
+        }
+        require('fs').unlinkSync(tempFile);
     } catch (err) {
         console.error('Error writing to config:', err.message);
         throw new Error('Cannot write to WireGuard configuration');
