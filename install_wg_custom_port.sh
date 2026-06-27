@@ -51,20 +51,21 @@ ask_domain() {
 
 ask_port() {
     echo ""
-    echo "Enter the WireGuard port (default: 51820)"
-    echo "Valid range: 1024-65535"
+    echo "WireGuard listens on a single UDP port."
+    echo "Default: 51820"
     echo ""
-    read -r -p "Port [51820]: " input_port
-    
+    read -r -p "Enter WireGuard UDP port [51820]: " input_port
+
     if [ -z "$input_port" ]; then
         WG_PORT=51820
-    elif [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1024 ] && [ "$input_port" -le 65535 ]; then
-        WG_PORT=$input_port
-    else
-        echo "Invalid port. Using default 51820."
+    elif ! [[ "$input_port" =~ ^[0-9]+$ ]] || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
+        echo "⚠️  Invalid port '$input_port'. Falling back to default 51820."
         WG_PORT=51820
+    else
+        WG_PORT="$input_port"
     fi
-    echo "→ Using WireGuard port: $WG_PORT"
+
+    echo "→ Using WireGuard UDP port: $WG_PORT"
 }
 
 # ────────────────────────────────────────────────
@@ -364,7 +365,8 @@ EOF
     # Fix sudoers file permissions
     chmod 440 /etc/sudoers.d/wgapi
 
-   cat > /usr/local/bin/wg-config-helper << 'EOF'
+    # Create a wrapper script for safe config operations
+    cat > /usr/local/bin/wg-config-helper << 'EOF'
 #!/bin/bash
 # Helper script to safely read/write WireGuard config
 
@@ -376,16 +378,8 @@ case "$1" in
         shift
         echo "$*" | sudo tee -a /etc/wireguard/wg0.conf > /dev/null
         ;;
-    append-file)
-        if [ -f "$2" ]; then
-            sudo cat "$2" | sudo tee -a /etc/wireguard/wg0.conf > /dev/null
-        else
-            echo "Error: File $2 not found"
-            exit 1
-        fi
-        ;;
     *)
-        echo "Usage: wg-config-helper {read|append|append-file} [content|file]"
+        echo "Usage: wg-config-helper {read|append} [content]"
         exit 1
         ;;
 esac
@@ -421,6 +415,7 @@ step_generate_token() {
     echo "→ Generated Bearer token: $API_TOKEN"
 }
 
+######step_write_server_js #####
 step_write_server_js() {
     echo "→ Writing Node.js API code..."
 
@@ -462,7 +457,7 @@ app.use((req, res, next) => {
     if (req.path === '/health') {
         return next();
     }
-
+    
     const auth = req.headers.authorization;
     if (!auth || auth !== 'Bearer ' + API_TOKEN) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -490,15 +485,7 @@ function readConfig() {
 // Helper function to append to config using sudo
 function appendToConfig(content) {
     try {
-        const tempFile = '/tmp/wg_append_temp';
-        require('fs').writeFileSync(tempFile, content);
-        execSync(`sudo /usr/local/bin/wg-config-helper append-file ${tempFile}`, { encoding: 'utf8' });
-        // Verify it was written
-        const newConfig = readConfig();
-        if (!newConfig.includes(content.trim())) {
-            throw new Error('Config append verification failed');
-        }
-        require('fs').unlinkSync(tempFile);
+        execSync(\`sudo /usr/local/bin/wg-config-helper append '\${content}'\`, { encoding: 'utf8' });
     } catch (err) {
         console.error('Error writing to config:', err.message);
         throw new Error('Cannot write to WireGuard configuration');
@@ -573,6 +560,7 @@ EOF
     echo "✓ server.js written"
 }
 
+########Function step_create_systemd_service########
 step_create_systemd_service() {
     echo "→ Creating systemd service for API..."
 
@@ -624,7 +612,7 @@ print_success_message() {
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
     echo "  Domain:          https://$DOMAIN"
-    echo "  WireGuard Port:  $WG_PORT"
+    echo "  WireGuard Port:  $WG_PORT/udp"
     echo "  Bearer Token:    $API_TOKEN"
     echo ""
     echo "  Create client config:"
@@ -683,8 +671,8 @@ install() {
     step_api_npm_setup
     step_generate_token
     step_write_server_js
-    step_create_systemd_service
-    step_configure_caddy
+    step_create_systemd_service    # ← MUST be before configure_caddy
+    step_configure_caddy            # ← ONLY ONCE
     print_success_message
 
     echo "Done."
@@ -718,6 +706,15 @@ read -r -p "Are you sure? Type 'yes' to confirm: " confirm
 }
 
 detect_outbound_interface
+
+# Detect the actual configured port from the live config, since the
+# in-memory default may not match what was chosen at install time.
+if [ -f "$WG_CONFIG" ]; then
+    detected_port=$(grep -E '^ListenPort' "$WG_CONFIG" | head -n1 | awk -F'=' '{gsub(/ /,"",$2); print $2}')
+    if [[ "$detected_port" =~ ^[0-9]+$ ]]; then
+        WG_PORT="$detected_port"
+    fi
+fi
 
 echo ""
 echo "Detected:"
@@ -932,6 +929,7 @@ echo ""
 
 }
 
+
 # ────────────────────────────────────────────────
 # CLI argument parsing
 # ────────────────────────────────────────────────
@@ -939,33 +937,11 @@ echo ""
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --port=*)           
-                PORT_VALUE="${1#*=}"
-                if [[ "$PORT_VALUE" =~ ^[0-9]+$ ]] && [ "$PORT_VALUE" -ge 1024 ] && [ "$PORT_VALUE" -le 65535 ]; then
-                    WG_PORT="$PORT_VALUE"
-                else
-                    echo "Error: Invalid port. Must be between 1024-65535."
-                    exit 1
-                fi
-                shift 
-                ;;
-            --api-port=*)       
-                API_PORT_INTERNAL="${1#*=}" 
-                shift 
-                ;;
-            --uninstall|-u)     
-                ACTION="uninstall" 
-                shift 
-                ;;
-            --help|-h)          
-                show_help 
-                exit 0 
-                ;;
-            *) 
-                echo "Unknown argument: $1" 
-                show_help 
-                exit 1 
-                ;;
+            --port=*)           WG_PORT="${1#*=}" ; shift ;;
+            --api-port=*)       API_PORT_INTERNAL="${1#*=}" ; shift ;;
+            --uninstall|-u)     ACTION="uninstall" ; shift ;;
+            --help|-h)          show_help ; exit 0 ;;
+            *) echo "Unknown argument: $1" ; show_help ; exit 1 ;;
         esac
     done
 }
@@ -979,12 +955,11 @@ show_help() {
     echo "  sudo ./install-wg.sh                  → interactive menu"
     echo "  sudo ./install-wg.sh --help           → this help"
     echo "  sudo ./install-wg.sh --uninstall      → remove setup"
-    echo "  sudo ./install-wg.sh --port=51830     → custom WireGuard port (1024-65535)"
+    echo "  sudo ./install-wg.sh --port=51830     → custom WireGuard port"
     echo "  sudo ./install-wg.sh --api-port=4000  → custom internal API port"
     echo ""
-    echo "Note: During interactive install you will be asked for:"
-    echo "  • A domain name (required for HTTPS)"
-    echo "  • WireGuard port (default: 51820)"
+    echo "Note: During interactive install you will be asked for a domain"
+    echo "      and a WireGuard port."
     echo "========================================"
 }
 
@@ -1019,4 +994,18 @@ show_menu() {
 # ────────────────────────────────────────────────
 
 check_root
-show_menu
+parse_args "$@"
+
+if [ -n "$ACTION" ]; then
+    if [ "$ACTION" = "uninstall" ]; then
+        uninstall
+    else
+        install
+    fi
+    exit 0
+fi
+
+# Interactive mode
+while true; do
+    show_menu
+done
