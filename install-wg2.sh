@@ -536,11 +536,19 @@ app.post('/create', (req, res) => {
 });
 
 app.post('/remove', (req, res) => {
-    const { publicKey } = req.body;
-    if (!publicKey) return res.status(400).json({ error: 'publicKey required' });
+    const { ipAddress } = req.body;
+    if (!ipAddress) return res.status(400).json({ error: 'ipAddress required' });
+
+    // Basic IPv4 sanity check
+    const ipOnly = ipAddress.split('/')[0];
+    const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+    if (!ipv4Regex.test(ipOnly)) {
+        return res.status(400).json({ error: 'invalid ipAddress format' });
+    }
+
     try {
-        execSync(\`sudo /usr/local/bin/wg-remove "\${publicKey}"\`);
-        res.json({ success: true });
+        execSync(`sudo /usr/local/bin/wg-remove "${ipOnly}"`);
+        res.json({ success: true, removed: ipOnly });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
