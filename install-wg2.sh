@@ -88,18 +88,18 @@ step_install_packages() {
 
     if ! command -v node >/dev/null 2>&1; then
         echo "→ Node.js not found, installing NodeSource Node.js..."
-
         curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
         apt install -y nodejs
-
-        echo "→ Node installed:"
-        node -v
-        npm -v
     else
         echo "→ Node.js already installed, skipping installation"
-        node -v
-        npm -v
     fi
+    
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "→ npm not found, installing..."
+        apt install -y npm
+    fi
+
+    echo "→ Node: $(node -v)   npm: $(npm -v)"
 }
 
 step_install_caddy() {
@@ -657,7 +657,7 @@ print_success_message() {
     echo "  curl -X POST https://$DOMAIN/remove \\"
     echo "    -H \"Authorization: Bearer $API_TOKEN\" \\"
     echo "    -H \"Content-Type: application/json\" \\"
-    echo "    -d '{\"publicKey\": \"...\"}'"
+    echo "    -d '{\"ipAddress\": \"...\"}'"
     echo ""
     echo "  Logs:"
     echo "    Caddy:     /var/log/caddy/wg-api.log"
