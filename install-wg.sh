@@ -572,7 +572,8 @@ app.post('/remove', (req, res) => {
     }
 
     try {
-        execSync(`sudo /usr/local/bin/wg-remove "${ipOnly}"`);
+        //execSync(`sudo /usr/local/bin/wg-remove "${ipOnly}"`);
+        execSync(\`sudo /usr/local/bin/wg-remove "\${ipOnly}"\`);
         res.json({ success: true, removed: ipOnly });
     } catch (err) {
         console.error(err);
