@@ -362,6 +362,7 @@ chmod 600 "$WG_CONFIG"
 echo "Removed peer block from $WG_CONFIG"
 EOF
 chmod +x /usr/local/bin/wg-remove
+}
 
 step_configure_sudoers() {
     echo "→ Configuring sudo permissions for wgapi..."
