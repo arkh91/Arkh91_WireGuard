@@ -49,6 +49,25 @@ ask_domain() {
     fi
 }
 
+ask_port() {
+    echo ""
+    echo "WireGuard listens on a single UDP port."
+    echo "Default: 51820"
+    echo ""
+    read -r -p "Enter WireGuard UDP port [51820]: " input_port
+
+    if [ -z "$input_port" ]; then
+        WG_PORT=51820
+    elif ! [[ "$input_port" =~ ^[0-9]+$ ]] || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
+        echo "⚠️  Invalid port '$input_port'. Falling back to default 51820."
+        WG_PORT=51820
+    else
+        WG_PORT="$input_port"
+    fi
+
+    echo "→ Using WireGuard UDP port: $WG_PORT"
+}
+
 # ────────────────────────────────────────────────
 # Installation steps – each in its own function
 # ────────────────────────────────────────────────
@@ -69,18 +88,18 @@ step_install_packages() {
 
     if ! command -v node >/dev/null 2>&1; then
         echo "→ Node.js not found, installing NodeSource Node.js..."
-
         curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
         apt install -y nodejs
-
-        echo "→ Node installed:"
-        node -v
-        npm -v
     else
         echo "→ Node.js already installed, skipping installation"
-        node -v
-        npm -v
     fi
+    
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "→ npm not found, installing..."
+        apt install -y npm
+    fi
+
+    echo "→ Node: $(node -v)   npm: $(npm -v)"
 }
 
 step_install_caddy() {
@@ -156,7 +175,7 @@ step_install_caddy() {
     if ! command -v caddy >/dev/null 2>&1; then
         echo "✗ Caddy binary not found after installation"
         echo "Attempting alternative installation method..."
-        
+
         # Alternative: Download directly from Caddy's website
         curl -fsSL https://caddyserver.com/api/download?os=linux&arch=amd64 -o /tmp/caddy.tar.gz
         tar -xzf /tmp/caddy.tar.gz -C /tmp
@@ -270,46 +289,71 @@ set -e
 
 WG_IF="wg0"
 WG_CONFIG="/etc/wireguard/${WG_IF}.conf"
-PUBLIC_KEY="$1"
+IP_ADDR="$1"
 
-if [ -z "$PUBLIC_KEY" ]; then
-  echo "Usage: wg-remove <public-key>"
+if [ -z "$IP_ADDR" ]; then
+  echo "Usage: wg-remove <ip-address>"
   exit 1
 fi
 
-# ── Step 1: Remove from live interface ──────────
-/usr/bin/wg set "$WG_IF" peer "$PUBLIC_KEY" remove
-echo "Removed peer from live interface: $PUBLIC_KEY"
+IP_ADDR="${IP_ADDR%/32}"
+MATCH_LINE="AllowedIPs = ${IP_ADDR}/32"
 
-# ── Step 2: Remove [Peer] block from config file ─
-# Strategy: read the file, skip the block that contains our key,
-# write everything else back. Uses awk for reliable multi-line matching.
+# ── Step 1: find the PublicKey that owns this IP ──
+PUBLIC_KEY=$(awk -v match_line="$MATCH_LINE" '
+  /^\[Peer\]/ { in_peer=1; key=""; hit=0; next }
+  /^\[/ && !/^\[Peer\]/ { in_peer=0 }
+  in_peer && /^PublicKey/ {
+    line=$0; sub(/^PublicKey[ \t]*=[ \t]*/, "", line); key=line
+  }
+  in_peer && index($0, match_line) > 0 { hit=1 }
+  in_peer && hit && key != "" { found=key }
+  END { print found }
+' "$WG_CONFIG")
+
+if [ -z "$PUBLIC_KEY" ]; then
+  echo "Error: no peer found with AllowedIPs ${IP_ADDR}/32"
+  exit 1
+fi
+
+# ── Step 2: Remove from live interface ──────────
+/usr/bin/wg set "$WG_IF" peer "$PUBLIC_KEY" remove
+echo "Removed peer from live interface: $PUBLIC_KEY (IP: $IP_ADDR)"
+
+# ── Step 3: Remove [Peer] block from config file ─
 TMPFILE=$(mktemp)
 
-awk -v key="$PUBLIC_KEY" '
-  /^\[Peer\]/ {
-    # Buffer this section until we know if it is ours
+awk -v match_line="$MATCH_LINE" '
+BEGIN { in_peer=0; block="" }
+/^\[Peer\]/ {
+    if (in_peer) {
+        if (index(block, match_line) == 0) printf "%s", block
+    }
     block = $0 "\n"
     in_peer = 1
     next
-  }
-  in_peer {
-    # Another section header means the buffered block is done
-    if (/^\[/) {
-      if (block !~ key) printf "%s", block
-      block = ""
-      in_peer = 0
-      # Fall through and print this new header normally
-    } else {
-      block = block $0 "\n"
-      next
+}
+/^\[/ {
+    if (in_peer) {
+        if (index(block, match_line) == 0) printf "%s", block
+        block = ""
+        in_peer = 0
     }
-  }
-  # Flush buffered peer block at end of file
-  END {
-    if (in_peer && block !~ key) printf "%s", block
-  }
-  { print }
+    print
+    next
+}
+{
+    if (in_peer) {
+        block = block $0 "\n"
+    } else {
+        print
+    }
+}
+END {
+    if (in_peer) {
+        if (index(block, match_line) == 0) printf "%s", block
+    }
+}
 ' "$WG_CONFIG" > "$TMPFILE"
 
 mv "$TMPFILE" "$WG_CONFIG"
@@ -317,7 +361,7 @@ chmod 600 "$WG_CONFIG"
 
 echo "Removed peer block from $WG_CONFIG"
 EOF
-  chmod +x /usr/local/bin/wg-remove
+chmod +x /usr/local/bin/wg-remove
 }
 
 step_configure_sudoers() {
@@ -333,7 +377,7 @@ EOF
 
 step_fix_permissions() {
     echo "→ Fixing WireGuard permissions for API access..."
-    
+
     # Add sudo permissions for file operations
     cat >> /etc/sudoers.d/wgapi << 'EOF'
 
@@ -345,7 +389,7 @@ EOF
 
     # Fix sudoers file permissions
     chmod 440 /etc/sudoers.d/wgapi
-    
+
     # Create a wrapper script for safe config operations
     cat > /usr/local/bin/wg-config-helper << 'EOF'
 #!/bin/bash
@@ -367,17 +411,17 @@ esac
 EOF
 
     chmod +x /usr/local/bin/wg-config-helper
-    
+
     # Add sudo permission for the helper script
     echo "wgapi ALL=(root) NOPASSWD: /usr/local/bin/wg-config-helper" >> /etc/sudoers.d/wgapi
-    
+
     # Test permissions
     if sudo -u wgapi sudo cat /etc/wireguard/wg0.conf &>/dev/null; then
         echo "✓ wgapi can read WireGuard config"
     else
         echo "⚠️  Warning: wgapi cannot read config directly, will use helper"
     fi
-    
+
     echo "✓ Permissions configured successfully"
 }
 
@@ -517,11 +561,19 @@ app.post('/create', (req, res) => {
 });
 
 app.post('/remove', (req, res) => {
-    const { publicKey } = req.body;
-    if (!publicKey) return res.status(400).json({ error: 'publicKey required' });
+    const { ipAddress } = req.body;
+    if (!ipAddress) return res.status(400).json({ error: 'ipAddress required' });
+
+    // Basic IPv4 sanity check
+    const ipOnly = ipAddress.split('/')[0];
+    const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+    if (!ipv4Regex.test(ipOnly)) {
+        return res.status(400).json({ error: 'invalid ipAddress format' });
+    }
+
     try {
-        execSync(\`sudo /usr/local/bin/wg-remove "\${publicKey}"\`);
-        res.json({ success: true });
+        execSync(`sudo /usr/local/bin/wg-remove "${ipOnly}"`);
+        res.json({ success: true, removed: ipOnly });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
@@ -544,7 +596,7 @@ EOF
 ########Function step_create_systemd_service########
 step_create_systemd_service() {
     echo "→ Creating systemd service for API..."
-    
+
     cat > "/etc/systemd/system/${API_SERVICE}" << EOF
 [Unit]
 Description=WireGuard API Service
@@ -572,7 +624,7 @@ EOF
 
 step_configure_caddy() {
     echo "→ Configuring Caddy reverse proxy..."
-    
+
     cat > /etc/caddy/Caddyfile << EOF
 ${DOMAIN} {
     reverse_proxy localhost:${API_PORT_INTERNAL}
@@ -593,6 +645,7 @@ print_success_message() {
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
     echo "  Domain:          https://$DOMAIN"
+    echo "  WireGuard Port:  $WG_PORT/udp"
     echo "  Bearer Token:    $API_TOKEN"
     echo ""
     echo "  Create client config:"
@@ -604,7 +657,7 @@ print_success_message() {
     echo "  curl -X POST https://$DOMAIN/remove \\"
     echo "    -H \"Authorization: Bearer $API_TOKEN\" \\"
     echo "    -H \"Content-Type: application/json\" \\"
-    echo "    -d '{\"publicKey\": \"...\"}'"
+    echo "    -d '{\"ipAddress\": \"...\"}'"
     echo ""
     echo "  Logs:"
     echo "    Caddy:     /var/log/caddy/wg-api.log"
@@ -628,6 +681,7 @@ install() {
 
     detect_outbound_interface
     ask_domain
+    ask_port
 
     step_install_packages
     echo "Installing Packages Done..."
@@ -646,7 +700,7 @@ install() {
     step_install_wg_remove
     step_configure_sudoers
     step_fix_permissions
-    
+
     step_api_npm_setup
     step_generate_token
     step_write_server_js
@@ -678,7 +732,6 @@ echo "   • Helper scripts"
 echo "   • Installed packages (optional)"
 echo ""
 
-```
 read -r -p "Are you sure? Type 'yes' to confirm: " confirm
 [[ "$confirm" != "yes" ]] && {
     echo "Aborted."
@@ -686,6 +739,15 @@ read -r -p "Are you sure? Type 'yes' to confirm: " confirm
 }
 
 detect_outbound_interface
+
+# Detect the actual configured port from the live config, since the
+# in-memory default may not match what was chosen at install time.
+if [ -f "$WG_CONFIG" ]; then
+    detected_port=$(grep -E '^ListenPort' "$WG_CONFIG" | head -n1 | awk -F'=' '{gsub(/ /,"",$2); print $2}')
+    if [[ "$detected_port" =~ ^[0-9]+$ ]]; then
+        WG_PORT="$detected_port"
+    fi
+fi
 
 echo ""
 echo "Detected:"
@@ -897,7 +959,6 @@ echo ""
 echo "A reboot is recommended if you want to ensure"
 echo "the WireGuard kernel module is fully unloaded."
 echo ""
-```
 
 }
 
@@ -930,7 +991,8 @@ show_help() {
     echo "  sudo ./install-wg.sh --port=51830     → custom WireGuard port"
     echo "  sudo ./install-wg.sh --api-port=4000  → custom internal API port"
     echo ""
-    echo "Note: During interactive install you will be asked for a domain."
+    echo "Note: During interactive install you will be asked for a domain"
+    echo "      and a WireGuard port."
     echo "========================================"
 }
 
@@ -965,20 +1027,18 @@ show_menu() {
 # ────────────────────────────────────────────────
 
 check_root
-show_menu
+parse_args "$@"
 
-#parse_args "$@"
-
-#if [ -n "$ACTION" ]; then
-#    if [ "$ACTION" = "uninstall" ]; then
-#        uninstall
-#    else
-#        install
-#    fi
-#    exit 0
-#fi
+if [ -n "$ACTION" ]; then
+    if [ "$ACTION" = "uninstall" ]; then
+        uninstall
+    else
+        install
+    fi
+    exit 0
+fi
 
 # Interactive mode
-#while true; do
-#    show_menu
-#done
+while true; do
+    show_menu
+done
