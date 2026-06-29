@@ -1,0 +1,1044 @@
+#!/bin/bash
+# WireGuard + Secure HTTPS API Installer / Manager
+# Ubuntu/Debian – modular, production-ready with Caddy + Bearer token
+# Version: re-done clean – February 2025 style
+
+set -e
+
+# ────────────────────────────────────────────────
+# Configuration defaults
+# ────────────────────────────────────────────────
+
+WG_INTERFACE="wg0"
+WG_PORT=51820
+WG_NETWORK="10.66.66.0/24"
+API_PORT_INTERNAL=4242           # Node.js listens here (localhost only)
+API_DIR="/opt/wg-api"
+API_SERVICE="wg-api.service"
+WG_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
+OUT_IFACE=""
+DOMAIN=""
+CADDY_PORT=443
+
+# ────────────────────────────────────────────────
+# Utility functions
+# ────────────────────────────────────────────────
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo "Error: This script must be run as root."
+        exit 1
+    fi
+}
+
+detect_outbound_interface() {
+    OUT_IFACE=$(ip -4 route show default | awk '{print $5; exit}' || echo "eth0")
+    echo "→ Detected outbound interface: $OUT_IFACE"
+}
+
+ask_domain() {
+    echo ""
+    echo "For automatic HTTPS (Let's Encrypt via Caddy) you need a domain."
+    echo "Example: vpn-api.yourdomain.com"
+    echo "The A record must point to this server's public IP."
+    echo ""
+    read -r -p "Enter domain: " DOMAIN
+    if [ -z "$DOMAIN" ]; then
+        echo "Domain is required for secure installation. Aborting."
+        exit 1
+    fi
+}
+
+ask_port() {
+    echo ""
+    echo "WireGuard listens on a single UDP port."
+    echo "Default: 51820"
+    echo ""
+    read -r -p "Enter WireGuard UDP port [51820]: " input_port
+
+    if [ -z "$input_port" ]; then
+        WG_PORT=51820
+    elif ! [[ "$input_port" =~ ^[0-9]+$ ]] || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
+        echo "⚠️  Invalid port '$input_port'. Falling back to default 51820."
+        WG_PORT=51820
+    else
+        WG_PORT="$input_port"
+    fi
+
+    echo "→ Using WireGuard UDP port: $WG_PORT"
+}
+
+# ────────────────────────────────────────────────
+# Installation steps – each in its own function
+# ────────────────────────────────────────────────
+
+step_install_packages() {
+    echo "→ Installing required packages..."
+    apt update -y
+
+    apt install -y \
+        wireguard \
+        iptables \
+        iptables-persistent \
+        curl \
+        openssl \
+        gnupg \
+        sudo \
+        jq
+
+    if ! command -v node >/dev/null 2>&1; then
+        echo "→ Node.js not found, installing NodeSource Node.js..."
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt install -y nodejs
+    else
+        echo "→ Node.js already installed, skipping installation"
+    fi
+    
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "→ npm not found, installing..."
+        apt install -y npm
+    fi
+
+    echo "→ Node: $(node -v)   npm: $(npm -v)"
+}
+
+step_install_caddy() {
+    echo "→ Installing Caddy web server..."
+
+    # Detect OS
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+    else
+        echo "✗ Unable to detect Linux distribution"
+        return 1
+    fi
+
+    case "$ID" in
+        ubuntu|debian|linuxmint|pop|kali|raspbian)
+            apt update
+
+            apt install -y \
+                debian-keyring \
+                debian-archive-keyring \
+                apt-transport-https \
+                curl \
+                gnupg
+
+            # Add Caddy repository - FIXED VERSION
+            if [ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]; then
+                curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+                    | gpg --dearmor \
+                    -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+            fi
+
+            # CORRECTED: Use the proper .list file URL, not .deb
+            if [ ! -f /etc/apt/sources.list.d/caddy-stable.list ]; then
+                echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/ubuntu $(lsb_release -cs) main" > /etc/apt/sources.list.d/caddy-stable.list
+            fi
+
+            apt update
+            apt install -y caddy
+            ;;
+
+        rocky|almalinux|rhel|centos)
+            dnf install -y epel-release
+            dnf install -y caddy
+            ;;
+
+        fedora)
+            dnf install -y caddy
+            ;;
+
+        arch|manjaro)
+            pacman -Sy --noconfirm caddy
+            ;;
+
+        opensuse-leap|opensuse-tumbleweed|opensuse)
+            zypper --non-interactive refresh
+            zypper --non-interactive install caddy
+            ;;
+
+        alpine)
+            apk add --no-cache caddy
+            ;;
+
+        *)
+            echo "✗ Unsupported Linux distribution:"
+            echo "  $PRETTY_NAME"
+            echo
+            echo "Falling back to direct package install..."
+            apt install -y caddy || dnf install -y caddy || pacman -S --noconfirm caddy || echo "Please install Caddy manually from https://caddyserver.com/download"
+            ;;
+    esac
+
+    # Verify binary exists
+    if ! command -v caddy >/dev/null 2>&1; then
+        echo "✗ Caddy binary not found after installation"
+        echo "Attempting alternative installation method..."
+
+        # Alternative: Download directly from Caddy's website
+        curl -fsSL https://caddyserver.com/api/download?os=linux&arch=amd64 -o /tmp/caddy.tar.gz
+        tar -xzf /tmp/caddy.tar.gz -C /tmp
+        mv /tmp/caddy /usr/bin/
+        chmod +x /usr/bin/caddy
+        rm /tmp/caddy.tar.gz
+    fi
+
+    # Create caddy user if it doesn't exist
+    if ! id caddy &>/dev/null; then
+        useradd -r -s /usr/sbin/nologin caddy
+    fi
+
+    # Create necessary directories
+    mkdir -p /etc/caddy /var/log/caddy /var/lib/caddy
+    chown -R caddy:caddy /var/log/caddy /var/lib/caddy
+
+    # Enable and start service
+    systemctl daemon-reload
+    systemctl enable caddy 2>/dev/null || true
+    systemctl restart caddy || true
+
+    # Verify service is running
+    if systemctl is-active --quiet caddy; then
+        echo "✓ Caddy installed successfully"
+        echo "  Version: $(caddy version 2>/dev/null || echo 'unknown')"
+    else
+        echo "⚠️  Caddy installed but service not started"
+        echo "  You may need to start it manually: systemctl start caddy"
+    fi
+}
+
+step_wireguard_keys_config() {
+    echo "→ Generating WireGuard server keys and base config..."
+
+    SERVER_PRIVATE_KEY=$(wg genkey)
+    SERVER_PUBLIC_KEY=$(echo "$SERVER_PRIVATE_KEY" | wg pubkey)
+
+    mkdir -p /etc/wireguard
+
+    cat > "$WG_CONFIG" <<END
+[Interface]
+Address = 10.66.66.1/24
+ListenPort = $WG_PORT
+PrivateKey = $SERVER_PRIVATE_KEY
+END
+
+    chmod 600 "$WG_CONFIG"
+
+    # Save keys for API use
+    echo "$SERVER_PRIVATE_KEY" > /etc/wireguard/server_private.key
+    echo "$SERVER_PUBLIC_KEY" > /etc/wireguard/server_public.key
+    chmod 600 /etc/wireguard/server_private.key
+    chmod 644 /etc/wireguard/server_public.key
+
+    echo "→ Server public key: $SERVER_PUBLIC_KEY"
+}
+
+step_enable_ip_forward() {
+    echo "→ Enabling IP forwarding..."
+    sysctl -w net.ipv4.ip_forward=1
+    sed -i 's/^#\{0,1\}net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+}
+
+step_firewall_rules() {
+    echo "→ Setting up basic iptables rules..."
+    iptables -A INPUT -p udp --dport "$WG_PORT" -j ACCEPT
+    iptables -A FORWARD -i "$WG_INTERFACE" -j ACCEPT
+    iptables -A FORWARD -o "$WG_INTERFACE" -j ACCEPT
+    iptables -t nat -A POSTROUTING -s "$WG_NETWORK" -o "$OUT_IFACE" -j MASQUERADE
+    netfilter-persistent save
+}
+
+step_start_wireguard() {
+    echo "→ Enabling & starting WireGuard interface..."
+    systemctl enable --now wg-quick@"$WG_INTERFACE"
+}
+
+step_create_api_user() {
+    echo "→ Creating non-root user for API (wgapi)..."
+    id wgapi 2>/dev/null || useradd -r -s /usr/sbin/nologin wgapi
+}
+
+step_install_wg_provision() {
+    echo "→ Installing wg-provision..."
+
+    cat > /usr/local/bin/wg-provision << 'EOF'
+#!/bin/bash
+set -e
+
+WG_IF="wg0"
+PUBLIC_KEY="$1"
+IP="$2"
+
+if [ -z "$PUBLIC_KEY" ] || [ -z "$IP" ]; then
+  echo "Usage: wg-provision <public-key> <ip>"
+  exit 1
+fi
+
+/usr/bin/wg set "$WG_IF" peer "$PUBLIC_KEY" allowed-ips "$IP/32"
+EOF
+
+    chmod +x /usr/local/bin/wg-provision
+}
+
+step_install_wg_remove() {
+  echo "→ Installing wg-remove..."
+  cat > /usr/local/bin/wg-remove << 'EOF'
+#!/bin/bash
+set -e
+
+WG_IF="wg0"
+WG_CONFIG="/etc/wireguard/${WG_IF}.conf"
+IP_ADDR="$1"
+
+if [ -z "$IP_ADDR" ]; then
+  echo "Usage: wg-remove <ip-address>"
+  exit 1
+fi
+
+IP_ADDR="${IP_ADDR%/32}"
+MATCH_LINE="AllowedIPs = ${IP_ADDR}/32"
+
+# ── Step 1: find the PublicKey that owns this IP ──
+PUBLIC_KEY=$(awk -v match_line="$MATCH_LINE" '
+  /^\[Peer\]/ { in_peer=1; key=""; hit=0; next }
+  /^\[/ && !/^\[Peer\]/ { in_peer=0 }
+  in_peer && /^PublicKey/ {
+    line=$0; sub(/^PublicKey[ \t]*=[ \t]*/, "", line); key=line
+  }
+  in_peer && index($0, match_line) > 0 { hit=1 }
+  in_peer && hit && key != "" { found=key }
+  END { print found }
+' "$WG_CONFIG")
+
+if [ -z "$PUBLIC_KEY" ]; then
+  echo "Error: no peer found with AllowedIPs ${IP_ADDR}/32"
+  exit 1
+fi
+
+# ── Step 2: Remove from live interface ──────────
+/usr/bin/wg set "$WG_IF" peer "$PUBLIC_KEY" remove
+echo "Removed peer from live interface: $PUBLIC_KEY (IP: $IP_ADDR)"
+
+# ── Step 3: Remove [Peer] block from config file ─
+TMPFILE=$(mktemp)
+
+awk -v match_line="$MATCH_LINE" '
+BEGIN { in_peer=0; block="" }
+/^\[Peer\]/ {
+    if (in_peer) {
+        if (index(block, match_line) == 0) printf "%s", block
+    }
+    block = $0 "\n"
+    in_peer = 1
+    next
+}
+/^\[/ {
+    if (in_peer) {
+        if (index(block, match_line) == 0) printf "%s", block
+        block = ""
+        in_peer = 0
+    }
+    print
+    next
+}
+{
+    if (in_peer) {
+        block = block $0 "\n"
+    } else {
+        print
+    }
+}
+END {
+    if (in_peer) {
+        if (index(block, match_line) == 0) printf "%s", block
+    }
+}
+' "$WG_CONFIG" > "$TMPFILE"
+
+mv "$TMPFILE" "$WG_CONFIG"
+chmod 600 "$WG_CONFIG"
+
+echo "Removed peer block from $WG_CONFIG"
+EOF
+chmod +x /usr/local/bin/wg-remove
+}
+
+step_configure_sudoers() {
+    echo "→ Configuring sudo permissions for wgapi..."
+
+    cat > /etc/sudoers.d/wgapi << 'EOF'
+wgapi ALL=(root) NOPASSWD: /usr/local/bin/wg-provision
+wgapi ALL=(root) NOPASSWD: /usr/local/bin/wg-remove
+EOF
+
+    chmod 440 /etc/sudoers.d/wgapi
+}
+
+step_fix_permissions() {
+    echo "→ Fixing WireGuard permissions for API access..."
+
+    # Add sudo permissions for file operations
+    cat >> /etc/sudoers.d/wgapi << 'EOF'
+
+# Allow wgapi to read/write WireGuard config file
+wgapi ALL=(root) NOPASSWD: /usr/bin/cat /etc/wireguard/wg0.conf
+wgapi ALL=(root) NOPASSWD: /usr/bin/tee -a /etc/wireguard/wg0.conf
+wgapi ALL=(root) NOPASSWD: /usr/bin/chmod 600 /etc/wireguard/wg0.conf
+EOF
+
+    # Fix sudoers file permissions
+    chmod 440 /etc/sudoers.d/wgapi
+
+    # Create a wrapper script for safe config operations
+    cat > /usr/local/bin/wg-config-helper << 'EOF'
+#!/bin/bash
+# Helper script to safely read/write WireGuard config
+
+case "$1" in
+    read)
+        sudo cat /etc/wireguard/wg0.conf
+        ;;
+    append)
+        shift
+        echo "$*" | sudo tee -a /etc/wireguard/wg0.conf > /dev/null
+        ;;
+    *)
+        echo "Usage: wg-config-helper {read|append} [content]"
+        exit 1
+        ;;
+esac
+EOF
+
+    chmod +x /usr/local/bin/wg-config-helper
+
+    # Add sudo permission for the helper script
+    echo "wgapi ALL=(root) NOPASSWD: /usr/local/bin/wg-config-helper" >> /etc/sudoers.d/wgapi
+
+    # Test permissions
+    if sudo -u wgapi sudo cat /etc/wireguard/wg0.conf &>/dev/null; then
+        echo "✓ wgapi can read WireGuard config"
+    else
+        echo "⚠️  Warning: wgapi cannot read config directly, will use helper"
+    fi
+
+    echo "✓ Permissions configured successfully"
+}
+
+step_api_npm_setup() {
+    echo "→ Preparing API directory and npm dependencies..."
+    mkdir -p "$API_DIR"
+    chown wgapi:wgapi "$API_DIR"
+    cd "$API_DIR" || exit 1
+
+    npm init -y >/dev/null 2>&1
+    npm install express express-rate-limit helmet >/dev/null 2>&1
+}
+
+step_generate_token() {
+    API_TOKEN=$(openssl rand -hex 32)
+    echo "→ Generated Bearer token: $API_TOKEN"
+}
+
+######step_write_server_js #####
+step_write_server_js() {
+    echo "→ Writing Node.js API code..."
+
+    if [ -f "/etc/wireguard/server_public.key" ]; then
+        SERVER_PUBLIC_KEY=$(cat /etc/wireguard/server_public.key)
+    else
+        echo "⚠️  Warning: server_public.key not found."
+        SERVER_PUBLIC_KEY="MISSING"
+    fi
+
+    cat > "$API_DIR/server.js" <<EOF
+const express = require('express');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const { execSync } = require('child_process');
+
+const app = express();
+
+// Trust proxy (Caddy is our reverse proxy)
+app.set('trust proxy', true);
+
+app.use(helmet());
+app.use(express.json());
+
+// Rate limiter with proxy support
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    message: 'Too many requests, please try again later.',
+    validate: { xForwardedForHeader: false }
+});
+app.use(limiter);
+
+const API_TOKEN = '${API_TOKEN}';
+
+// Authentication middleware (excludes health endpoint)
+app.use((req, res, next) => {
+    // Skip auth for health endpoint
+    if (req.path === '/health') {
+        return next();
+    }
+    
+    const auth = req.headers.authorization;
+    if (!auth || auth !== 'Bearer ' + API_TOKEN) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+});
+
+const WG_CONFIG = '${WG_CONFIG}';
+const SERVER_PUB = '${SERVER_PUBLIC_KEY}';
+const ENDPOINT = '${DOMAIN}';
+const WG_PORT = ${WG_PORT};
+const BASE_IP = '10.66.66.';
+
+// Helper function to read config using sudo
+function readConfig() {
+    try {
+        const result = execSync('sudo /usr/local/bin/wg-config-helper read', { encoding: 'utf8' });
+        return result;
+    } catch (err) {
+        console.error('Error reading config:', err.message);
+        throw new Error('Cannot read WireGuard configuration');
+    }
+}
+
+// Helper function to append to config using sudo
+function appendToConfig(content) {
+    try {
+        execSync(\`sudo /usr/local/bin/wg-config-helper append '\${content}'\`, { encoding: 'utf8' });
+    } catch (err) {
+        console.error('Error writing to config:', err.message);
+        throw new Error('Cannot write to WireGuard configuration');
+    }
+}
+
+function getNextIP() {
+    const config = readConfig();
+    const matches = config.match(/10\\.66\\.66\\.(\\d+)/g) || [];
+    const used = matches.map(ip => parseInt(ip.split('.').pop(), 10));
+    for (let i = 2; i <= 254; i++) {
+        if (!used.includes(i)) return BASE_IP + i;
+    }
+    throw new Error('IP pool exhausted');
+}
+
+app.post('/create', (req, res) => {
+    try {
+        const privateKey = execSync('wg genkey', { encoding: 'utf8' }).trim();
+        const publicKey = execSync('wg pubkey', { input: privateKey, encoding: 'utf8' }).trim();
+        const clientIP = getNextIP();
+
+        const peerConfig = \`\n[Peer]\nPublicKey = \${publicKey}\nAllowedIPs = \${clientIP}/32\n\`;
+        appendToConfig(peerConfig);
+
+        execSync(\`sudo /usr/local/bin/wg-provision "\${publicKey}" "\${clientIP}"\`);
+
+        // Build the config as plain text
+        const cfg = 
+            '[Interface]\\n' +
+            'PrivateKey = ' + privateKey + '\\n' +
+            'Address = ' + clientIP + '/32\\n' +
+            'DNS = 1.1.1.1\\n' +
+            '\\n' +
+            '[Peer]\\n' +
+            'PublicKey = ' + SERVER_PUB + '\\n' +
+            'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\\n' +
+            'AllowedIPs = 0.0.0.0/0\\n' +
+            'PersistentKeepalive = 25' + '\n';
+
+        // Return plain text config instead of JSON
+        res.setHeader('Content-Type', 'text/plain');
+        res.send(cfg);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/remove', (req, res) => {
+    const { ipAddress } = req.body;
+    if (!ipAddress) return res.status(400).json({ error: 'ipAddress required' });
+
+    // Basic IPv4 sanity check
+    const ipOnly = ipAddress.split('/')[0];
+    const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+    if (!ipv4Regex.test(ipOnly)) {
+        return res.status(400).json({ error: 'invalid ipAddress format' });
+    }
+
+    try {
+        execSync(\`sudo /usr/local/bin/wg-remove "\${ipOnly}"\`);
+        res.json({ success: true, removed: ipOnly });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.listen(${API_PORT_INTERNAL}, '127.0.0.1', () => {
+    console.log('API listening on localhost:${API_PORT_INTERNAL}');
+});
+EOF
+
+    chown -R wgapi:wgapi "$API_DIR"
+    echo "✓ server.js written"
+}
+
+########Function step_create_systemd_service########
+step_create_systemd_service() {
+    echo "→ Creating systemd service for API..."
+
+    cat > "/etc/systemd/system/${API_SERVICE}" << EOF
+[Unit]
+Description=WireGuard API Service
+After=network.target
+
+[Service]
+Type=simple
+User=wgapi
+Group=wgapi
+WorkingDirectory=${API_DIR}
+ExecStart=/usr/bin/node ${API_DIR}/server.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "${API_SERVICE}"
+    systemctl start "${API_SERVICE}"
+    echo "✓ Systemd service created and started"
+}
+
+step_configure_caddy() {
+    echo "→ Configuring Caddy reverse proxy..."
+
+    cat > /etc/caddy/Caddyfile << EOF
+${DOMAIN} {
+    reverse_proxy localhost:${API_PORT_INTERNAL}
+    log {
+        output file /var/log/caddy/wg-api.log
+    }
+}
+EOF
+
+    systemctl restart caddy
+    echo "✓ Caddy configured"
+}
+
+print_success_message() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "                SECURE WIREGUARD API INSTALLED"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "  Domain:          https://$DOMAIN"
+    echo "  WireGuard Port:  $WG_PORT/udp"
+    echo "  Bearer Token:    $API_TOKEN"
+    echo ""
+    echo "  Create client config:"
+    echo "  curl -X POST https://$DOMAIN/create \\"
+    echo "    -H \"Authorization: Bearer $API_TOKEN\" \\"
+    echo "    -H \"Content-Type: application/json\""
+    echo ""
+    echo "  Remove client (example):"
+    echo "  curl -X POST https://$DOMAIN/remove \\"
+    echo "    -H \"Authorization: Bearer $API_TOKEN\" \\"
+    echo "    -H \"Content-Type: application/json\" \\"
+    echo "    -d '{\"ipAddress\": \"...\"}'"
+    echo ""
+    echo "  Logs:"
+    echo "    Caddy:     /var/log/caddy/wg-api.log"
+    echo "    Service:   journalctl -u $API_SERVICE -f"
+    echo ""
+    echo "  Security notes:"
+    echo "  • Keep the token secret"
+    echo "  • HTTPS is automatic via Let's Encrypt"
+    echo "  • Node.js runs as non-root user wgapi"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+}
+
+# ────────────────────────────────────────────────
+# Main install function (orchestrator)
+# ────────────────────────────────────────────────
+
+install() {
+    echo "Starting secure WireGuard + HTTPS API installation..."
+    echo ""
+
+    detect_outbound_interface
+    ask_domain
+    ask_port
+
+    step_install_packages
+    echo "Installing Packages Done..."
+    step_install_caddy
+    echo "Install Caddy Done..."
+    step_wireguard_keys_config
+    echo "wireguard key config Done..."
+    step_enable_ip_forward
+    echo "Enable IP forward Done..."
+    step_firewall_rules
+    echo "firewall rules Done..."
+    step_start_wireguard
+    step_create_api_user
+
+    step_install_wg_provision
+    step_install_wg_remove
+    step_configure_sudoers
+    step_fix_permissions
+
+    step_api_npm_setup
+    step_generate_token
+    step_write_server_js
+    step_create_systemd_service    # ← MUST be before configure_caddy
+    step_configure_caddy            # ← ONLY ONCE
+    print_success_message
+
+    echo "Done."
+}
+
+# ────────────────────────────────────────────────
+# Uninstall
+# ────────────────────────────────────────────────
+
+uninstall() {
+echo ""
+echo "════════════════════════════════════════════════════"
+echo "         WireGuard + API Full Uninstaller"
+echo "════════════════════════════════════════════════════"
+echo ""
+echo "⚠️  This will remove:"
+echo "   • WireGuard interface & config"
+echo "   • Node.js API service & files"
+echo "   • Caddy web server & config"
+echo "   • iptables rules"
+echo "   • sudoers entries"
+echo "   • wgapi system user"
+echo "   • Helper scripts"
+echo "   • Installed packages (optional)"
+echo ""
+
+read -r -p "Are you sure? Type 'yes' to confirm: " confirm
+[[ "$confirm" != "yes" ]] && {
+    echo "Aborted."
+    return 0
+}
+
+detect_outbound_interface
+
+# Detect the actual configured port from the live config, since the
+# in-memory default may not match what was chosen at install time.
+if [ -f "$WG_CONFIG" ]; then
+    detected_port=$(grep -E '^ListenPort' "$WG_CONFIG" | head -n1 | awk -F'=' '{gsub(/ /,"",$2); print $2}')
+    if [[ "$detected_port" =~ ^[0-9]+$ ]]; then
+        WG_PORT="$detected_port"
+    fi
+fi
+
+echo ""
+echo "Detected:"
+echo "  Interface : $WG_INTERFACE"
+echo "  Config    : $WG_CONFIG"
+echo "  API Dir   : $API_DIR"
+echo "  WG Port   : $WG_PORT"
+echo "  Outbound  : $OUT_IFACE"
+echo ""
+
+# ─────────────────────────────────────────────
+# 1. Stop services
+# ─────────────────────────────────────────────
+echo "→ [1/10] Stopping services..."
+
+for svc in "wg-quick@${WG_INTERFACE}" "${API_SERVICE}" caddy; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}"; then
+
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" || true
+            echo "  ✓ Stopped $svc"
+        fi
+
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            systemctl disable "$svc" || true
+            echo "  ✓ Disabled $svc"
+        fi
+    fi
+done
+
+# ─────────────────────────────────────────────
+# 2. Remove WireGuard interface
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [2/10] Removing WireGuard interface..."
+
+wg-quick down "$WG_INTERFACE" 2>/dev/null || true
+
+if ip link show "$WG_INTERFACE" &>/dev/null; then
+    ip link delete "$WG_INTERFACE" 2>/dev/null || true
+fi
+
+echo "  ✓ Interface cleanup complete"
+
+# ─────────────────────────────────────────────
+# 3. Remove iptables rules
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [3/10] Removing iptables rules..."
+
+while iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null; do
+    echo "  ✓ Removed INPUT rule"
+done
+
+while iptables -D FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null; do
+    echo "  ✓ Removed FORWARD inbound rule"
+done
+
+while iptables -D FORWARD -o "$WG_INTERFACE" -j ACCEPT 2>/dev/null; do
+    echo "  ✓ Removed FORWARD outbound rule"
+done
+
+while iptables -t nat -D POSTROUTING -s "$WG_NETWORK" -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null; do
+    echo "  ✓ Removed MASQUERADE rule"
+done
+
+netfilter-persistent save 2>/dev/null || true
+
+# ─────────────────────────────────────────────
+# 4. Remove systemd units
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [4/10] Removing systemd units..."
+
+rm -f "/etc/systemd/system/${API_SERVICE}"
+rm -rf "/etc/systemd/system/${API_SERVICE}.d"
+
+systemctl daemon-reload
+
+echo "  ✓ Removed API service units"
+
+# ─────────────────────────────────────────────
+# 5. Remove configuration files
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [5/10] Removing configuration files..."
+
+rm -f "$WG_CONFIG"
+rm -f /etc/wireguard/server_private.key
+rm -f /etc/wireguard/server_public.key
+
+rmdir /etc/wireguard 2>/dev/null || true
+
+rm -f /etc/caddy/Caddyfile
+rm -rf /etc/caddy
+rm -rf /var/lib/caddy
+rm -rf /var/log/caddy
+
+rm -rf "$API_DIR"
+
+echo "  ✓ Configuration files removed"
+
+# ─────────────────────────────────────────────
+# 6. Remove helper scripts
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [6/10] Removing helper scripts..."
+
+rm -f /usr/local/bin/wg-provision
+rm -f /usr/local/bin/wg-remove
+rm -f /usr/local/bin/wg-config-helper
+
+echo "  ✓ Helper scripts removed"
+
+# ─────────────────────────────────────────────
+# 7. Remove sudoers entries
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [7/10] Removing sudoers entries..."
+
+rm -f /etc/sudoers.d/wgapi
+
+echo "  ✓ Removed sudoers configuration"
+
+# ─────────────────────────────────────────────
+# 8. Remove system user
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [8/10] Removing wgapi user..."
+
+if id wgapi &>/dev/null; then
+    userdel -r wgapi 2>/dev/null || userdel wgapi 2>/dev/null || true
+    echo "  ✓ Removed user wgapi"
+else
+    echo "  ↷ User wgapi not found"
+fi
+
+# ─────────────────────────────────────────────
+# 9. Remove packages
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [9/10] Package cleanup..."
+
+PACKAGES=(
+    wireguard
+    wireguard-tools
+    caddy
+    nodejs
+    npm
+    iptables-persistent
+    netfilter-persistent
+)
+
+echo ""
+echo "Packages that may be removed:"
+printf '  • %s\n' "${PACKAGES[@]}"
+echo ""
+
+read -r -p "Remove these packages? [y/N]: " rm_pkgs
+
+if [[ "$rm_pkgs" =~ ^[Yy]$ ]]; then
+
+    apt remove --purge -y "${PACKAGES[@]}" || true
+    apt autoremove -y || true
+    apt autoclean -y || true
+
+    rm -f /etc/apt/sources.list.d/caddy-stable.list
+    rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+    apt update -y || true
+
+    echo "  ✓ Packages removed"
+else
+    echo "  ↷ Package removal skipped"
+fi
+
+# ─────────────────────────────────────────────
+# 10. Revert IP forwarding
+# ─────────────────────────────────────────────
+echo ""
+echo "→ [10/10] IP forwarding..."
+
+read -r -p "Disable IPv4 forwarding? [y/N]: " revert_fwd
+
+if [[ "$revert_fwd" =~ ^[Yy]$ ]]; then
+
+    sysctl -w net.ipv4.ip_forward=0 >/dev/null
+
+    if [ -f /etc/sysctl.conf ]; then
+        sed -i '/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=/d' /etc/sysctl.conf
+        echo "net.ipv4.ip_forward=0" >> /etc/sysctl.conf
+    fi
+
+    sysctl -p >/dev/null 2>&1 || true
+
+    echo "  ✓ IP forwarding disabled"
+else
+    echo "  ↷ IP forwarding unchanged"
+fi
+
+echo ""
+echo "════════════════════════════════════════════════════"
+echo "              Uninstall Complete ✓"
+echo "════════════════════════════════════════════════════"
+echo ""
+echo "All WireGuard/API components installed by this"
+echo "script have been removed."
+echo ""
+echo "A reboot is recommended if you want to ensure"
+echo "the WireGuard kernel module is fully unloaded."
+echo ""
+
+}
+
+
+# ────────────────────────────────────────────────
+# CLI argument parsing
+# ────────────────────────────────────────────────
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port=*)           WG_PORT="${1#*=}" ; shift ;;
+            --api-port=*)       API_PORT_INTERNAL="${1#*=}" ; shift ;;
+            --uninstall|-u)     ACTION="uninstall" ; shift ;;
+            --help|-h)          show_help ; exit 0 ;;
+            *) echo "Unknown argument: $1" ; show_help ; exit 1 ;;
+        esac
+    done
+}
+
+show_help() {
+    echo "========================================"
+    echo "  WireGuard + Secure API Manager"
+    echo "========================================"
+    echo ""
+    echo "Usage:"
+    echo "  sudo ./install-wg.sh                  → interactive menu"
+    echo "  sudo ./install-wg.sh --help           → this help"
+    echo "  sudo ./install-wg.sh --uninstall      → remove setup"
+    echo "  sudo ./install-wg.sh --port=51830     → custom WireGuard port"
+    echo "  sudo ./install-wg.sh --api-port=4000  → custom internal API port"
+    echo ""
+    echo "Note: During interactive install you will be asked for a domain"
+    echo "      and a WireGuard port."
+    echo "========================================"
+}
+
+# ────────────────────────────────────────────────
+# Interactive menu
+# ────────────────────────────────────────────────
+
+show_menu() {
+    clear
+    echo "========================================"
+    echo "     Secure WireGuard Manager"
+    echo "========================================"
+    echo ""
+    echo "  1) Install WireGuard + HTTPS API"
+    echo "  2) Uninstall"
+    echo "  3) Usage / Help"
+    echo "  0) Exit"
+    echo ""
+    read -r -p "Choose [0-3]: " choice
+
+    case "$choice" in
+        1) install ; read -r -p "Press Enter to continue..." ;;
+        2) uninstall ; read -r -p "Press Enter to continue..." ;;
+        3) show_help ; read -r -p "Press Enter to continue..." ;;
+        0) echo "Goodbye."; exit 0 ;;
+        *) echo "Invalid choice."; sleep 1 ;;
+    esac
+}
+
+# ────────────────────────────────────────────────
+# Entry point
+# ────────────────────────────────────────────────
+
+check_root
+parse_args "$@"
+
+if [ -n "$ACTION" ]; then
+    if [ "$ACTION" = "uninstall" ]; then
+        uninstall
+    else
+        install
+    fi
+    exit 0
+fi
+
+# Interactive mode
+while true; do
+    show_menu
+done
