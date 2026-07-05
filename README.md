@@ -81,6 +81,8 @@ chmod 600 /home/wg-monitor/.ssh/authorized_keys
 Append the following configuration to `/etc/ssh/sshd_config`:
 
 ```text
+cat >> /etc/ssh/sshd_config << 'EOF'
+
 Match User wg-monitor
     PasswordAuthentication no
     PermitTTY no
@@ -88,6 +90,7 @@ Match User wg-monitor
     AllowTcpForwarding no
     X11Forwarding no
     ForceCommand sudo /usr/bin/wg show wg0 dump
+EOF
 ```
 
 Reload the SSH service:
