@@ -117,3 +117,21 @@ sudo /usr/bin/wg show wg0 dump
 
 This provides the management server with read-only access to WireGuard peer information while preventing any other commands from being executed.
 
+# ── On each VPN server ────
+1. Sanity-check config before/after reload
+On the VPN server, before relying on it:
+
+```bash
+# Validate sshd config syntax — catches typos in the Match block
+sshd -t
+# If that's clean, then:
+systemctl reload ssh
+# Confirm sshd actually picked up the change
+systemctl status ssh --no-pager
+journalctl -u ssh -n 20 --no-pager
+```
+
+2. Confirm the forced command works (from US08)
+```bash
+ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP
+```
