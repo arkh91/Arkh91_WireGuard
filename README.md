@@ -93,7 +93,7 @@ Match User wg-monitor
 Reload the SSH service:
 
 ```bash
-systemctl reload sshd
+systemctl reload ssh
 ```
 
 ---
