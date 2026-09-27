@@ -28,7 +28,7 @@ works the same way here as it does on a local copy:
 
 ```bash
 # Add/repair wg-monitor on a node installed this way, without a full reinstall
-bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install_wg_custom_port.sh) --add-monitor
+bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg3.sh) --add-monitor
 ```
 
 Putting `--add-monitor` (or any flag) *before* the closing `)` — e.g.
