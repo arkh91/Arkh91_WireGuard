@@ -2,6 +2,7 @@
 # WireGuard + Secure HTTPS API Installer / Manager
 # Ubuntu/Debian – modular, production-ready with Caddy + Bearer token
 # Version: re-done clean – February 2025 style
+# + wg-monitor account (key-only SSH, ForceCommand to wg-peer-ctrl.sh)
 
 set -e
 
@@ -19,6 +20,13 @@ WG_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
 OUT_IFACE=""
 DOMAIN=""
 CADDY_PORT=443
+
+# wg-monitor: read-only/enforcement account used by the management server
+# (US08) to pull traffic stats and enforce limits over SSH.
+WG_MONITOR_USER="wg-monitor"
+WG_MONITOR_HOME="/home/${WG_MONITOR_USER}"
+WG_MONITOR_PUBKEY=""
+WG_PEER_CTRL_PATH="/usr/local/bin/wg-peer-ctrl.sh"
 
 # ────────────────────────────────────────────────
 # Utility functions
@@ -68,6 +76,25 @@ ask_port() {
     echo "→ Using WireGuard UDP port: $WG_PORT"
 }
 
+# Usage: ask_wg_monitor_pubkey
+# Prompts for the management server's (US08) wg-monitor public key.
+# Paste the CONTENTS of /root/.ssh/wg_monitor_key.pub from US08 — not the
+# private key. Leaving this blank skips wg-monitor setup for now; it can
+# be added later by re-running this script with --add-monitor.
+ask_wg_monitor_pubkey() {
+    echo ""
+    echo "For traffic monitoring and enforcement, the management server"
+    echo "(US08) needs restricted SSH access to this node as 'wg-monitor'."
+    echo ""
+    echo "On US08, this key already exists (or is generated) at:"
+    echo "  /root/.ssh/wg_monitor_key.pub"
+    echo ""
+    echo "Paste its CONTENTS below (one line, starts with 'ssh-ed25519' or"
+    echo "similar). Leave blank to skip this step for now."
+    echo ""
+    read -r -p "wg-monitor public key: " WG_MONITOR_PUBKEY
+}
+
 # ────────────────────────────────────────────────
 # Installation steps – each in its own function
 # ────────────────────────────────────────────────
@@ -93,7 +120,7 @@ step_install_packages() {
     else
         echo "→ Node.js already installed, skipping installation"
     fi
-    
+
     if ! command -v npm >/dev/null 2>&1; then
         echo "→ npm not found, installing..."
         apt install -y npm
@@ -482,7 +509,7 @@ app.use((req, res, next) => {
     if (req.path === '/health') {
         return next();
     }
-    
+
     const auth = req.headers.authorization;
     if (!auth || auth !== 'Bearer ' + API_TOKEN) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -539,7 +566,7 @@ app.post('/create', (req, res) => {
         execSync(\`sudo /usr/local/bin/wg-provision "\${publicKey}" "\${clientIP}"\`);
 
         // Build the config as plain text
-        const cfg = 
+        const cfg =
             '[Interface]\\n' +
             'PrivateKey = ' + privateKey + '\\n' +
             'Address = ' + clientIP + '/32\\n' +
@@ -638,6 +665,303 @@ EOF
     echo "✓ Caddy configured"
 }
 
+# ────────────────────────────────────────────────
+# wg-monitor: management-server access for traffic sync + enforcement
+# ────────────────────────────────────────────────
+
+# Usage: step_install_wg_peer_ctrl
+# Deploys the ForceCommand dispatcher that wg-monitor's SSH sessions are
+# locked into. This is the ONLY thing wg-monitor can ever execute — every
+# verb (dump / disable / enable / suspend / unsuspend / setlimit /
+# clearlimit) is validated inside this one script.
+step_install_wg_peer_ctrl() {
+    echo "→ Installing wg-peer-ctrl.sh (ForceCommand dispatcher)..."
+
+    cat > "$WG_PEER_CTRL_PATH" << 'CTRL_EOF'
+#!/bin/bash
+# wg-peer-ctrl.sh — ForceCommand dispatcher for wg-monitor SSH sessions.
+# Also directly callable locally (no SSH_ORIGINAL_COMMAND) — see CMD line.
+#
+# Runs as root via the sudoers entry created by step_create_wg_monitor_user,
+# which permits this exact binary and nothing else — no internal "sudo".
+#
+# Permitted commands:
+#   (empty)                       -> wg show wg0 dump        (traffic sync)
+#   peer-disable <pubkey>         -> wg set ... remove       (expire peer)
+#   peer-enable  <pubkey> <cidr>  -> wg set ... allowed-ips  (re-enable peer)
+#   peer-suspend   <cidr>         -> iptables DROP            (suspend peer)
+#   peer-unsuspend <cidr>         -> remove iptables DROP     (unsuspend peer)
+#   peer-setlimit  <cidr> <kbps>  -> tc htb cap, both directions
+#   peer-clearlimit <cidr>        -> remove tc cap
+#
+# NOTE on speed limiting: assumes a single flat /24 pool (10.66.66.0/24)
+# and uses the address's last octet as the tc classid.
+
+set -euo pipefail
+
+WG_IFACE="wg0"
+IFB_IFACE="ifb0"
+WG="/usr/bin/wg"
+IPT="/sbin/iptables"
+TC="/sbin/tc"
+SUSPEND_CHAIN="WG-SUSPEND"
+
+# Usage: is_valid_pubkey <key>
+# Validates a WireGuard public key: base64, exactly 44 chars ending in =
+is_valid_pubkey() { [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
+
+# Usage: is_valid_cidr <address>
+# Validates an IP/CIDR address like 10.66.66.5/32
+is_valid_cidr() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; }
+
+# Usage: is_valid_kbps <value>
+# Validates a positive integer kbps value.
+is_valid_kbps() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]]; }
+
+# Usage: audit <result> <message>
+# Writes one line per invocation to the system log for later review.
+audit() {
+    local result="$1"; shift
+    logger -t wg-peer-ctrl "result=${result} client=${SSH_CLIENT:-local} cmd=${CMD:-<empty>} $*"
+}
+
+# Usage: ensure_suspend_chain
+# Creates the WG-SUSPEND chain and hooks it into FORWARD if not already present.
+ensure_suspend_chain() {
+    "$IPT" -nL "$SUSPEND_CHAIN" >/dev/null 2>&1 || {
+        "$IPT" -N "$SUSPEND_CHAIN"
+        "$IPT" -I FORWARD 1 -j "$SUSPEND_CHAIN"
+    }
+}
+
+# Usage: persist_iptables
+# Saves iptables state so suspensions survive a reboot. No-op if unavailable.
+persist_iptables() {
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+}
+
+# Usage: class_id_for_ip <cidr>
+# Derives a stable tc classid from the last octet of the peer's IP.
+class_id_for_ip() {
+    local ip="${1%%/*}" last_octet
+    last_octet="${ip##*.}"
+    [[ "$last_octet" =~ ^[0-9]+$ ]] || return 1
+    echo "$last_octet"
+}
+
+# Usage: ensure_shaping_setup
+# One-time (idempotent) setup: ifb device, wg0->ifb0 ingress redirect,
+# and a root htb qdisc on both devices with an unlimited default class.
+ensure_shaping_setup() {
+    ip link show "$IFB_IFACE" &>/dev/null || {
+        modprobe ifb numifbs=1 2>/dev/null || true
+        ip link add "$IFB_IFACE" type ifb
+    }
+    ip link set "$IFB_IFACE" up
+
+    "$TC" qdisc show dev "$WG_IFACE" | grep -q "ingress" || {
+        "$TC" qdisc add dev "$WG_IFACE" handle ffff: ingress
+        "$TC" filter add dev "$WG_IFACE" parent ffff: protocol ip u32 \
+            match u32 0 0 flowid 1:1 action mirred egress redirect dev "$IFB_IFACE"
+    }
+
+    "$TC" qdisc show dev "$WG_IFACE" | grep -q "htb 1:" || {
+        "$TC" qdisc add dev "$WG_IFACE" root handle 1: htb default 999
+        "$TC" class add dev "$WG_IFACE" parent 1: classid 1:999 htb rate 1000mbit
+    }
+    "$TC" qdisc show dev "$IFB_IFACE" | grep -q "htb 1:" || {
+        "$TC" qdisc add dev "$IFB_IFACE" root handle 1: htb default 999
+        "$TC" class add dev "$IFB_IFACE" parent 1: classid 1:999 htb rate 1000mbit
+    }
+}
+
+CMD="${SSH_ORIGINAL_COMMAND:-$*}"
+read -r -a ARGS <<< "$CMD"
+NARGS=${#ARGS[@]}
+
+case "${ARGS[0]:-}" in
+
+    "")
+        [[ "$NARGS" -eq 0 ]] || { echo "ERROR: unexpected arguments" >&2; audit DENY "reason=args_on_empty"; exit 1; }
+        "$WG" show "$WG_IFACE" dump
+        audit OK "action=dump"
+        ;;
+
+    peer-disable)
+        [[ "$NARGS" -eq 2 ]] || { echo "ERROR: usage: peer-disable <pubkey>" >&2; audit DENY "reason=argc"; exit 1; }
+        PUBKEY="${ARGS[1]}"
+        is_valid_pubkey "$PUBKEY" || { echo "ERROR: invalid pubkey" >&2; audit DENY "reason=bad_pubkey"; exit 1; }
+        "$WG" set "$WG_IFACE" peer "$PUBKEY" remove
+        echo "OK: peer removed"
+        audit OK "action=disable pubkey=${PUBKEY:0:20}…"
+        ;;
+
+    peer-enable)
+        [[ "$NARGS" -eq 3 ]] || { echo "ERROR: usage: peer-enable <pubkey> <cidr>" >&2; audit DENY "reason=argc"; exit 1; }
+        PUBKEY="${ARGS[1]}"; ALLOWED_IPS="${ARGS[2]}"
+        is_valid_pubkey "$PUBKEY"     || { echo "ERROR: invalid pubkey" >&2;   audit DENY "reason=bad_pubkey"; exit 1; }
+        is_valid_cidr  "$ALLOWED_IPS" || { echo "ERROR: invalid IP/CIDR" >&2; audit DENY "reason=bad_cidr"; exit 1; }
+        "$WG" set "$WG_IFACE" peer "$PUBKEY" allowed-ips "$ALLOWED_IPS"
+        echo "OK: peer enabled with $ALLOWED_IPS"
+        audit OK "action=enable pubkey=${PUBKEY:0:20}… ip=${ALLOWED_IPS}"
+        ;;
+
+    peer-suspend)
+        [[ "$NARGS" -eq 2 ]] || { echo "ERROR: usage: peer-suspend <cidr>" >&2; audit DENY "reason=argc"; exit 1; }
+        IP="${ARGS[1]}"
+        is_valid_cidr "$IP" || { echo "ERROR: invalid IP/CIDR" >&2; audit DENY "reason=bad_cidr"; exit 1; }
+        ensure_suspend_chain
+        "$IPT" -C "$SUSPEND_CHAIN" -s "$IP" -j DROP 2>/dev/null || "$IPT" -A "$SUSPEND_CHAIN" -s "$IP" -j DROP
+        "$IPT" -C "$SUSPEND_CHAIN" -d "$IP" -j DROP 2>/dev/null || "$IPT" -A "$SUSPEND_CHAIN" -d "$IP" -j DROP
+        persist_iptables
+        echo "OK: iptables DROP in place for $IP"
+        audit OK "action=suspend ip=${IP}"
+        ;;
+
+    peer-unsuspend)
+        [[ "$NARGS" -eq 2 ]] || { echo "ERROR: usage: peer-unsuspend <cidr>" >&2; audit DENY "reason=argc"; exit 1; }
+        IP="${ARGS[1]}"
+        is_valid_cidr "$IP" || { echo "ERROR: invalid IP/CIDR" >&2; audit DENY "reason=bad_cidr"; exit 1; }
+        ensure_suspend_chain
+        "$IPT" -C "$SUSPEND_CHAIN" -s "$IP" -j DROP 2>/dev/null && "$IPT" -D "$SUSPEND_CHAIN" -s "$IP" -j DROP || true
+        "$IPT" -C "$SUSPEND_CHAIN" -d "$IP" -j DROP 2>/dev/null && "$IPT" -D "$SUSPEND_CHAIN" -d "$IP" -j DROP || true
+        persist_iptables
+        echo "OK: iptables DROP removed for $IP"
+        audit OK "action=unsuspend ip=${IP}"
+        ;;
+
+    peer-setlimit)
+        [[ "$NARGS" -eq 3 ]] || { echo "ERROR: usage: peer-setlimit <cidr> <kbps>" >&2; audit DENY "reason=argc"; exit 1; }
+        IP="${ARGS[1]}"; KBPS="${ARGS[2]}"
+        is_valid_cidr "$IP"   || { echo "ERROR: invalid IP/CIDR" >&2; audit DENY "reason=bad_cidr"; exit 1; }
+        is_valid_kbps "$KBPS" || { echo "ERROR: invalid kbps" >&2;    audit DENY "reason=bad_kbps"; exit 1; }
+        CID=$(class_id_for_ip "$IP") || { echo "ERROR: cannot derive class id" >&2; audit DENY "reason=bad_classid"; exit 1; }
+        ensure_shaping_setup
+        "$TC" class replace dev "$WG_IFACE" parent 1: classid "1:$CID" htb rate "${KBPS}kbit" ceil "${KBPS}kbit"
+        "$TC" filter replace dev "$WG_IFACE" parent 1: protocol ip u32 match ip dst "$IP" flowid "1:$CID"
+        "$TC" class replace dev "$IFB_IFACE" parent 1: classid "1:$CID" htb rate "${KBPS}kbit" ceil "${KBPS}kbit"
+        "$TC" filter replace dev "$IFB_IFACE" parent 1: protocol ip u32 match ip src "$IP" flowid "1:$CID"
+        echo "OK: ${KBPS}kbps limit applied for $IP"
+        audit OK "action=setlimit ip=${IP} kbps=${KBPS}"
+        ;;
+
+    peer-clearlimit)
+        [[ "$NARGS" -eq 2 ]] || { echo "ERROR: usage: peer-clearlimit <cidr>" >&2; audit DENY "reason=argc"; exit 1; }
+        IP="${ARGS[1]}"
+        is_valid_cidr "$IP" || { echo "ERROR: invalid IP/CIDR" >&2; audit DENY "reason=bad_cidr"; exit 1; }
+        CID=$(class_id_for_ip "$IP") || { echo "ERROR: cannot derive class id" >&2; audit DENY "reason=bad_classid"; exit 1; }
+        "$TC" filter del dev "$WG_IFACE" parent 1: protocol ip u32 match ip dst "$IP" flowid "1:$CID" 2>/dev/null || true
+        "$TC" class  del dev "$WG_IFACE" parent 1: classid "1:$CID" 2>/dev/null || true
+        "$TC" filter del dev "$IFB_IFACE" parent 1: protocol ip u32 match ip src "$IP" flowid "1:$CID" 2>/dev/null || true
+        "$TC" class  del dev "$IFB_IFACE" parent 1: classid "1:$CID" 2>/dev/null || true
+        echo "OK: limit cleared for $IP"
+        audit OK "action=clearlimit ip=${IP}"
+        ;;
+
+    *)
+        echo "ERROR: command not permitted: $CMD" >&2
+        audit DENY "reason=unknown_command"
+        exit 1
+        ;;
+esac
+CTRL_EOF
+
+    chown root:root "$WG_PEER_CTRL_PATH"
+    chmod 755 "$WG_PEER_CTRL_PATH"
+
+    if bash -n "$WG_PEER_CTRL_PATH"; then
+        echo "✓ wg-peer-ctrl.sh installed and syntax-checked"
+    else
+        echo "✗ wg-peer-ctrl.sh failed syntax check — aborting monitor setup"
+        return 1
+    fi
+}
+
+# Usage: step_create_wg_monitor_user
+# Creates the restricted 'wg-monitor' account: no shell, no password ever
+# accepted, key-only SSH, and forced into wg-peer-ctrl.sh for every
+# session. Safe to re-run — every step here is idempotent, so this can
+# be used both on a fresh install and to retrofit an already-deployed node.
+step_create_wg_monitor_user() {
+    echo "→ Setting up ${WG_MONITOR_USER} account for traffic monitoring..."
+
+    if [ -z "$WG_MONITOR_PUBKEY" ]; then
+        echo "  ↷ No public key provided — skipping wg-monitor setup."
+        echo "    Re-run this script with --add-monitor to add it later."
+        return 0
+    fi
+
+    # 1. Create the restricted system account.
+    #    Shell is /bin/bash, NOT /usr/sbin/nologin — this matters. sshd's
+    #    ForceCommand is executed AS "<shell> -c '<command>'", not instead
+    #    of the shell. nologin ignores its arguments and just refuses,
+    #    which silently breaks ForceCommand entirely (this account would
+    #    print "This account is currently not available." on every SSH
+    #    session and never reach wg-peer-ctrl.sh). Interactive use is
+    #    still fully blocked below by PermitTTY no + no forwarding, and
+    #    ForceCommand always wins over whatever command the client sends.
+    #    -M: no home dir auto-created (we manage .ssh ourselves below).
+    id "$WG_MONITOR_USER" &>/dev/null || useradd -r -s /bin/bash -M "$WG_MONITOR_USER"
+    usermod -s /bin/bash "$WG_MONITOR_USER"   # fixes accounts from an earlier (nologin) run
+
+    # 2. Create its SSH directory.
+    mkdir -p "${WG_MONITOR_HOME}/.ssh"
+    chown -R "${WG_MONITOR_USER}:${WG_MONITOR_USER}" "$WG_MONITOR_HOME"
+    chmod 700 "${WG_MONITOR_HOME}/.ssh"
+
+    # 3. Install the public key — overwrites any previous key on rerun.
+    echo "$WG_MONITOR_PUBKEY" > "${WG_MONITOR_HOME}/.ssh/authorized_keys"
+    chown "${WG_MONITOR_USER}:${WG_MONITOR_USER}" "${WG_MONITOR_HOME}/.ssh/authorized_keys"
+    chmod 600 "${WG_MONITOR_HOME}/.ssh/authorized_keys"
+
+    # 4. Deploy the dispatcher this account is locked into.
+    step_install_wg_peer_ctrl || return 1
+
+    # 5. Sudoers: allow wg-monitor to run ONLY wg-peer-ctrl.sh, as root,
+    #    with no password. env_keep is required because sudo strips
+    #    SSH_ORIGINAL_COMMAND by default — without it every call would
+    #    silently fall through to the no-argument dump case.
+    cat > /etc/sudoers.d/wg-monitor << SUDOEOF
+Defaults!${WG_PEER_CTRL_PATH} env_keep += "SSH_ORIGINAL_COMMAND"
+${WG_MONITOR_USER} ALL=(root) NOPASSWD: ${WG_PEER_CTRL_PATH}
+SUDOEOF
+    chmod 440 /etc/sudoers.d/wg-monitor
+
+    if ! visudo -c -f /etc/sudoers.d/wg-monitor >/dev/null 2>&1; then
+        echo "✗ sudoers syntax error — removing bad file to avoid breaking sudo."
+        rm -f /etc/sudoers.d/wg-monitor
+        return 1
+    fi
+
+    # 6. Lock down sshd for this one account: key-only, no shell, no
+    #    forwarding, forced command. Skipped if already present, so this
+    #    step is safe to re-run without duplicating the Match block.
+    if ! grep -q "^Match User ${WG_MONITOR_USER}$" /etc/ssh/sshd_config; then
+        cat >> /etc/ssh/sshd_config << SSHEOF
+
+Match User ${WG_MONITOR_USER}
+    PasswordAuthentication no
+    PermitTTY no
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    X11Forwarding no
+    ForceCommand sudo ${WG_PEER_CTRL_PATH}
+SSHEOF
+    else
+        echo "  ↷ sshd_config already has a Match block for ${WG_MONITOR_USER} — leaving it as-is."
+    fi
+
+    # 7. Never reload sshd on an unchecked config — a bad edit here can
+    #    lock out every SSH session on the box, not just wg-monitor's.
+    if sshd -t; then
+        systemctl reload ssh
+        echo "✓ ${WG_MONITOR_USER} ready: key-only SSH, forced into ${WG_PEER_CTRL_PATH}, no password ever accepted."
+    else
+        echo "✗ sshd config invalid after edit — NOT reloading. Check /etc/ssh/sshd_config manually."
+        return 1
+    fi
+}
+
 print_success_message() {
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
@@ -659,14 +983,22 @@ print_success_message() {
     echo "    -H \"Content-Type: application/json\" \\"
     echo "    -d '{\"ipAddress\": \"...\"}'"
     echo ""
+    if id "$WG_MONITOR_USER" &>/dev/null; then
+        echo "  Monitoring:      ${WG_MONITOR_USER} configured (key-only, no password)"
+    else
+        echo "  Monitoring:      NOT configured — run: $0 --add-monitor"
+    fi
+    echo ""
     echo "  Logs:"
     echo "    Caddy:     /var/log/caddy/wg-api.log"
     echo "    Service:   journalctl -u $API_SERVICE -f"
+    echo "    Monitor:   journalctl -t wg-peer-ctrl -f"
     echo ""
     echo "  Security notes:"
     echo "  • Keep the token secret"
     echo "  • HTTPS is automatic via Let's Encrypt"
     echo "  • Node.js runs as non-root user wgapi"
+    echo "  • wg-monitor cannot obtain a shell or accept a password"
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
 }
@@ -682,6 +1014,7 @@ install() {
     detect_outbound_interface
     ask_domain
     ask_port
+    ask_wg_monitor_pubkey
 
     step_install_packages
     echo "Installing Packages Done..."
@@ -706,9 +1039,22 @@ install() {
     step_write_server_js
     step_create_systemd_service    # ← MUST be before configure_caddy
     step_configure_caddy            # ← ONLY ONCE
+
+    step_create_wg_monitor_user     # ← wg-monitor: read/enforce access for US08
+
     print_success_message
 
     echo "Done."
+}
+
+# Usage: add_monitor_only
+# Standalone path for a node that already has WireGuard/API installed via
+# an earlier run of this script (or the original install-wg3.sh) but was
+# never given a wg-monitor account. Touches nothing else on the box.
+add_monitor_only() {
+    echo "Adding wg-monitor to an already-installed node..."
+    ask_wg_monitor_pubkey
+    step_create_wg_monitor_user
 }
 
 # ────────────────────────────────────────────────
@@ -727,7 +1073,7 @@ echo "   • Node.js API service & files"
 echo "   • Caddy web server & config"
 echo "   • iptables rules"
 echo "   • sudoers entries"
-echo "   • wgapi system user"
+echo "   • wgapi and wg-monitor system users"
 echo "   • Helper scripts"
 echo "   • Installed packages (optional)"
 echo ""
@@ -814,6 +1160,10 @@ while iptables -t nat -D POSTROUTING -s "$WG_NETWORK" -o "$OUT_IFACE" -j MASQUER
     echo "  ✓ Removed MASQUERADE rule"
 done
 
+iptables -F WG-SUSPEND 2>/dev/null || true
+iptables -D FORWARD -j WG-SUSPEND 2>/dev/null || true
+iptables -X WG-SUSPEND 2>/dev/null || true
+
 netfilter-persistent save 2>/dev/null || true
 
 # ─────────────────────────────────────────────
@@ -859,6 +1209,7 @@ echo "→ [6/10] Removing helper scripts..."
 rm -f /usr/local/bin/wg-provision
 rm -f /usr/local/bin/wg-remove
 rm -f /usr/local/bin/wg-config-helper
+rm -f "$WG_PEER_CTRL_PATH"
 
 echo "  ✓ Helper scripts removed"
 
@@ -869,20 +1220,28 @@ echo ""
 echo "→ [7/10] Removing sudoers entries..."
 
 rm -f /etc/sudoers.d/wgapi
+rm -f /etc/sudoers.d/wg-monitor
 
 echo "  ✓ Removed sudoers configuration"
 
 # ─────────────────────────────────────────────
-# 8. Remove system user
+# 8. Remove system users
 # ─────────────────────────────────────────────
 echo ""
-echo "→ [8/10] Removing wgapi user..."
+echo "→ [8/10] Removing wgapi and wg-monitor users..."
 
 if id wgapi &>/dev/null; then
     userdel -r wgapi 2>/dev/null || userdel wgapi 2>/dev/null || true
     echo "  ✓ Removed user wgapi"
 else
     echo "  ↷ User wgapi not found"
+fi
+
+if id "$WG_MONITOR_USER" &>/dev/null; then
+    userdel -r "$WG_MONITOR_USER" 2>/dev/null || userdel "$WG_MONITOR_USER" 2>/dev/null || true
+    echo "  ✓ Removed user ${WG_MONITOR_USER}"
+else
+    echo "  ↷ User ${WG_MONITOR_USER} not found"
 fi
 
 # ─────────────────────────────────────────────
@@ -973,6 +1332,7 @@ parse_args() {
             --port=*)           WG_PORT="${1#*=}" ; shift ;;
             --api-port=*)       API_PORT_INTERNAL="${1#*=}" ; shift ;;
             --uninstall|-u)     ACTION="uninstall" ; shift ;;
+            --add-monitor)      ACTION="add-monitor" ; shift ;;
             --help|-h)          show_help ; exit 0 ;;
             *) echo "Unknown argument: $1" ; show_help ; exit 1 ;;
         esac
@@ -985,14 +1345,17 @@ show_help() {
     echo "========================================"
     echo ""
     echo "Usage:"
-    echo "  sudo ./install-wg.sh                  → interactive menu"
-    echo "  sudo ./install-wg.sh --help           → this help"
-    echo "  sudo ./install-wg.sh --uninstall      → remove setup"
-    echo "  sudo ./install-wg.sh --port=51830     → custom WireGuard port"
-    echo "  sudo ./install-wg.sh --api-port=4000  → custom internal API port"
+    echo "  sudo ./install-wg3.sh                  → interactive menu"
+    echo "  sudo ./install-wg3.sh --help           → this help"
+    echo "  sudo ./install-wg3.sh --uninstall      → remove setup"
+    echo "  sudo ./install-wg3.sh --add-monitor    → add wg-monitor to an"
+    echo "                                            already-installed node"
+    echo "  sudo ./install-wg3.sh --port=51830     → custom WireGuard port"
+    echo "  sudo ./install-wg3.sh --api-port=4000  → custom internal API port"
     echo ""
-    echo "Note: During interactive install you will be asked for a domain"
-    echo "      and a WireGuard port."
+    echo "Note: During interactive install you will be asked for a domain,"
+    echo "      a WireGuard port, and (optionally) the management server's"
+    echo "      wg-monitor public key."
     echo "========================================"
 }
 
@@ -1008,15 +1371,17 @@ show_menu() {
     echo ""
     echo "  1) Install WireGuard + HTTPS API"
     echo "  2) Uninstall"
-    echo "  3) Usage / Help"
+    echo "  3) Add wg-monitor (retrofit an existing node)"
+    echo "  4) Usage / Help"
     echo "  0) Exit"
     echo ""
-    read -r -p "Choose [0-3]: " choice
+    read -r -p "Choose [0-4]: " choice
 
     case "$choice" in
         1) install ; read -r -p "Press Enter to continue..." ;;
         2) uninstall ; read -r -p "Press Enter to continue..." ;;
-        3) show_help ; read -r -p "Press Enter to continue..." ;;
+        3) add_monitor_only ; read -r -p "Press Enter to continue..." ;;
+        4) show_help ; read -r -p "Press Enter to continue..." ;;
         0) echo "Goodbye."; exit 0 ;;
         *) echo "Invalid choice."; sleep 1 ;;
     esac
@@ -1030,11 +1395,11 @@ check_root
 parse_args "$@"
 
 if [ -n "$ACTION" ]; then
-    if [ "$ACTION" = "uninstall" ]; then
-        uninstall
-    else
-        install
-    fi
+    case "$ACTION" in
+        uninstall)    uninstall ;;
+        add-monitor)  add_monitor_only ;;
+        *)            install ;;
+    esac
     exit 0
 fi
 
