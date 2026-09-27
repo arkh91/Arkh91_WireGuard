@@ -16,7 +16,7 @@ or, run directly from GitHub without downloading first:
 
 ```bash
 # Standard port
-bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg3.sh)
 
 # Custom port
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install_wg_custom_port.sh)
