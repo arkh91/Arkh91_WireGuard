@@ -13,6 +13,7 @@
 #   sudo ./wg-healthcheck.sh                   # run all checks
 #   sudo ./wg-healthcheck.sh --capture=20      # also sniff wg0 for 20s
 #   sudo ./wg-healthcheck.sh --if=wg1          # different interface
+#   sudo ./wg-healthcheck.sh --net=10.8.0.0/24 # different VPN subnet
 #   sudo ./wg-healthcheck.sh --report=/tmp/wg.txt   # also save output
 #   sudo ./wg-healthcheck.sh --no-color
 #
@@ -21,7 +22,6 @@
 # =============================================================================
 
 set -u
-set -o pipefail
 
 # ----------------------------- defaults --------------------------------------
 WG_IF="wg0"
@@ -96,6 +96,7 @@ parse_args() {
     for a in "$@"; do
         case "$a" in
             --if=*)       WG_IF="${a#*=}" ;;
+            --net=*)      WG_NET="${a#*=}" ;;
             --capture)    CAPTURE_SECS=15 ;;
             --capture=*)  CAPTURE_SECS="${a#*=}" ;;
             --report=*)   REPORT="${a#*=}"; USE_COLOR=0 ;;
@@ -438,7 +439,7 @@ check_firewall() {
         ok "NAT rules are re-applied at boot (netfilter-persistent or PostUp in ${WG_CONF})"
     else
         fail "nothing re-applies the NAT/FORWARD rules at boot (netfilter-persistent missing/disabled, no PostUp): they are lost on every reboot"
-        add_fix "vi ${WG_CONF}  -> under [Interface] add: PostUp = iptables -t nat -C POSTROUTING -s ${WG_NET} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${WG_NET} -j MASQUERADE"
+        add_fix "vi ${WG_CONF}  -> under [Interface] add: PostUp = iptables -t nat -C POSTROUTING -s ${WG_NET} ! -d ${WG_NET} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${WG_NET} ! -d ${WG_NET} -j MASQUERADE"
         add_fix "(alternative) apt install -y iptables-persistent && netfilter-persistent save   # note: also saves Docker's chains"
     fi
 }
@@ -455,12 +456,17 @@ check_nat() {
         add_fix "iptables -t nat -A POSTROUTING -s ${WG_NET} -o ${OUT_IFACE} -j MASQUERADE; netfilter-persistent save"
     else
         info "$(head -n3 <<<"$nat")"
-        if grep -qE -- "-s ${WG_NET//./\\.} .*-o ${OUT_IFACE} " <<<"$nat"; then
-            ok "MASQUERADE for ${WG_NET} via ${OUT_IFACE} exists"
+        local wgline; wgline=$(grep -F -- "-s ${WG_NET} " <<<"$nat" | head -n1)
+        if [ -n "$wgline" ] && { grep -qF -- "-o ${OUT_IFACE} " <<<"$wgline" || ! grep -qE -- '(^| )-o ' <<<"$wgline"; }; then
+            ok "MASQUERADE for ${WG_NET} exists (${wgline#-A POSTROUTING })"
+            if ! grep -qE -- '(^| )-o | ! -d ' <<<"$wgline"; then
+                warn "MASQUERADE rule has no -o and no '! -d ${WG_NET}': it also matches loopback traffic (MASQUERADE drops it), so the server's own queries to ${WG_IP:-the wg address} time out"
+                add_fix "iptables -t nat -A POSTROUTING -s ${WG_NET} ! -d ${WG_NET} -j MASQUERADE; iptables -t nat -D POSTROUTING -s ${WG_NET} -j MASQUERADE   # then update PostUp/PostDown in ${WG_CONF} with vi"
+            fi
         else
             fail "MASQUERADE exists but not for ${WG_NET} on current uplink ${OUT_IFACE} (interface renamed/changed since install?)"
             add_fix "iptables -t nat -A POSTROUTING -s ${WG_NET} -o ${OUT_IFACE} -j MASQUERADE; netfilter-persistent save   # and remove the stale rule"
-            add_fix "More robust: in ${WG_CONF} (vi) use PostUp = iptables -t nat -A POSTROUTING -s ${WG_NET} -j MASQUERADE  (no -o)"
+            add_fix "More robust: in ${WG_CONF} (vi) use PostUp = iptables -t nat -A POSTROUTING -s ${WG_NET} ! -d ${WG_NET} -j MASQUERADE  (no -o)"
         fi
     fi
 
