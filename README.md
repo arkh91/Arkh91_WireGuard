@@ -13,6 +13,7 @@ restricted SSH account (`wg-monitor`) that lets a central management server
 
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/wg-healthcheck.sh)
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/vpn-interference-check.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/vpn-doctor.sh)
 ```
 
 or, run directly from GitHub without downloading first:
