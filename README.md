@@ -10,6 +10,8 @@ restricted SSH account (`wg-monitor`) that lets a central management server
 
 ```bash
 ./install-wg3.sh
+
+bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/wg-healthcheck.sh)
 ```
 
 or, run directly from GitHub without downloading first:
