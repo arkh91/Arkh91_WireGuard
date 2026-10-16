@@ -28,7 +28,8 @@
 #   --domain=NAME            domain (or IP) clients use to reach the API
 #   --port=N                 WireGuard UDP port (default 51820)
 #   --https-port=N           public HTTPS port of the API; without it the installer shows
-#                            which of 443 8443 2053 2083 2087 2096 4443 9443 are free and asks
+#                            which of 443 8443 2053 2083 2087 2096 (the HTTPS ports Cloudflare
+#                            proxies) are free and asks
 #   --tls=selfsigned|letsencrypt
 #                            selfsigned (default): certificate made here, pinned by its SHA-256
 #                            fingerprint like Outline's certSha256; needs no port 80/443.
@@ -265,7 +266,15 @@ https_port_problem() {
     return 1
 }
 
-# Usage: ask_https_port -> scans the usual HTTPS ports and picks one: --https-port, a menu choice, or the first free one
+# Usage: cloudflare_port_note <port> -> warns when the port is not one Cloudflare proxies for HTTPS
+cloudflare_port_note() {
+    case "$1" in
+        443|2053|2083|2087|2096|8443) ;;
+        *) warn "Port $1 is not a Cloudflare-proxied HTTPS port (443 2053 2083 2087 2096 8443): fine with a DNS-only (grey cloud) record, but it will not work through the Cloudflare proxy." ;;
+    esac
+}
+
+# Usage: ask_https_port -> scans the Cloudflare HTTPS ports and picks one: --https-port, a menu choice, or the first free one
 ask_https_port() {
     [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ] || return 0
     if ! have ss; then
@@ -278,10 +287,12 @@ ask_https_port() {
         die "Internal API port ${API_PORT_INTERNAL} is in use by $(port_owner "$API_PORT_INTERNAL"). Pass --api-port=N."
     fi
 
-    local candidates=(443 8443 2053 2083 2087 2096 4443 9443) p i=0 default="" ans reason=""
+    # the HTTPS ports Cloudflare proxies, so the API also works behind an orange-cloud DNS record
+    local candidates=(443 8443 2053 2083 2087 2096) p i=0 default="" ans reason=""
     if [ -n "$HTTPS_PORT" ]; then
         if reason="$(https_port_problem "$HTTPS_PORT")"; then die "Cannot use HTTPS port ${HTTPS_PORT}: ${reason}."; fi
         ok "HTTPS port ${HTTPS_PORT} is free"
+        cloudflare_port_note "$HTTPS_PORT"
         return 0
     fi
 
@@ -295,7 +306,7 @@ ask_https_port() {
     fi
 
     echo
-    echo "HTTPS port for the management API (TCP):"
+    echo "HTTPS port for the management API (TCP), from Cloudflare's proxied HTTPS ports:"
     for p in "${candidates[@]}"; do
         i=$((i+1))
         if reason="$(https_port_problem "$p")"; then
@@ -321,6 +332,7 @@ ask_https_port() {
         break
     done
     ok "HTTPS port ${HTTPS_PORT}"
+    cloudflare_port_note "$HTTPS_PORT"
 }
 
 # Usage: ask_tls_mode -> decides the certificate type: custom (own files), letsencrypt (443 only) or selfsigned (default)
@@ -1358,6 +1370,8 @@ print_success_message() {
         if [ -n "$tlsopts" ]; then
             echo "  (the certificate is self-made: --pinnedpubkey checks it against the fingerprint above"
             echo "   instead of a public CA; change port or certificate later with --reconfigure-api)"
+            echo "  Behind the Cloudflare proxy (orange cloud) clients see Cloudflare's certificate instead:"
+            echo "  drop --insecure/--pinnedpubkey and set SSL/TLS mode to 'Full' so Cloudflare accepts this one."
         fi
     fi
     if [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 0 ]; then
