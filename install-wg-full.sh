@@ -1167,7 +1167,8 @@ step_configure_caddy() {
     [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ] || return 0
     say "Configuring Caddy for ${DOMAIN} on port ${HTTPS_PORT} (TLS: ${TLS_MODE})..."
     mkdir -p /etc/caddy /var/log/caddy
-    chown caddy:caddy /var/log/caddy 2>/dev/null || true
+    id caddy >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d /var/lib/caddy caddy
+    chown -R caddy:caddy /var/log/caddy
     if [ -f /etc/caddy/Caddyfile ] && ! grep -q 'install-wg-full.sh' /etc/caddy/Caddyfile; then
         cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak-$(date +%Y%m%d-%H%M%S)"
     fi
@@ -1204,10 +1205,17 @@ https://${DOMAIN}:${HTTPS_PORT} {
 END
     fi
     caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 || die "Caddyfile does not validate: caddy validate --config /etc/caddy/Caddyfile"
+    # 'caddy validate' runs as root and creates the log file owned by root; the service runs as
+    # user caddy and would then fail with "permission denied", so hand the log files back
+    chown -R caddy:caddy /var/log/caddy
     systemctl enable caddy >/dev/null 2>&1 || true
-    if ! systemctl restart caddy; then
+    systemctl reset-failed caddy >/dev/null 2>&1 || true
+    systemctl restart caddy || true
+    # 'systemctl restart' can report success even when Caddy exits a moment later: check for real
+    sleep 2
+    if ! systemctl is-active --quiet caddy || { have ss && ! port_in_use "$HTTPS_PORT"; }; then
         journalctl -u caddy -n 15 --no-pager >&2 || true
-        die "Caddy failed to start. Is port ${HTTPS_PORT} really free? (ss -ltnp 'sport = :${HTTPS_PORT}')"
+        die "Caddy is not running on port ${HTTPS_PORT}. Details above; also: systemctl status caddy --no-pager -l"
     fi
     compute_api_url
     ok "Caddy proxies ${API_URL} to 127.0.0.1:${API_PORT_INTERNAL}"
