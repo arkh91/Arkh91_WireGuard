@@ -5,8 +5,9 @@
 # Installs on Debian/Ubuntu:
 #   - WireGuard (wg0, 10.66.66.0/24) with NAT/forward rules in PostUp/PostDown
 #     (survive reboots) and ip_forward persisted in /etc/sysctl.d
-#   - wg-api  (Node.js, localhost only) behind Caddy with automatic HTTPS and a
-#     Bearer token: POST /create, POST /remove, GET /health
+#   - wg-api  (Node.js, localhost only) behind Caddy on an HTTPS port YOU choose
+#     (the installer scans for free ports) with a Bearer token:
+#     POST /create, POST /remove, GET /health. Nothing listens on port 80.
 #   - /usr/local/bin/wg-peer-ctrl.sh   restricted dispatcher (suspend, limits...)
 #   - /usr/local/bin/wg-healthcheck.sh health check  (from the repo)
 #   - /usr/local/bin/vpn-doctor.sh     diagnose + fix (from the repo)
@@ -15,20 +16,33 @@
 #
 # Usage:
 #   sudo ./install-wg-full.sh                        interactive menu
-#   sudo ./install-wg-full.sh --domain=vpn-api.example.com --port=51820
+#   sudo ./install-wg-full.sh --domain=vpn-api.example.com --port=51820 --https-port=8443
 #   sudo ./install-wg-full.sh --no-api               WireGuard + tools only (no Caddy/Node)
+#   sudo ./install-wg-full.sh --reconfigure-api      change the API HTTPS port/certificate of an
+#                                                    existing install (WireGuard keys untouched)
 #   sudo ./install-wg-full.sh --add-monitor --monitor-key-file=/root/wg_monitor_key.pub
 #   sudo ./install-wg-full.sh --update-tools         re-fetch healthcheck/doctor scripts
 #   sudo ./install-wg-full.sh --uninstall
 #
 # Options:
-#   --domain=NAME            domain for the HTTPS API (A record must point here)
+#   --domain=NAME            domain (or IP) clients use to reach the API
 #   --port=N                 WireGuard UDP port (default 51820)
+#   --https-port=N           public HTTPS port of the API; without it the installer shows
+#                            which of 443 8443 2053 2083 2087 2096 4443 9443 are free and asks
+#   --tls=selfsigned|letsencrypt
+#                            selfsigned (default): certificate made here, pinned by its SHA-256
+#                            fingerprint like Outline's certSha256; needs no port 80/443.
+#                            letsencrypt: only with --https-port=443 (validation needs the
+#                            internet to reach 80 or 443)
+#   --tls-cert=FILE --tls-key=FILE
+#                            use your own certificate (copied; does not follow renewals)
 #   --api-port=N             internal API port (default 4242)
 #   --dns=IP[,IP]            DNS handed to clients (default 1.1.1.1)
 #   --monitor-key="ssh-..."  public key of the management server (wg-monitor)
 #   --monitor-key-file=FILE  same, read from a file
 #   --no-api                 skip Caddy, Node and the API
+#   --no-caddy               install the API but not Caddy; use this when nginx (or another
+#                            web server) already owns 80/443. An nginx snippet is printed.
 #   --force                  replace an existing wg0.conf (backs it up first)
 #   --yes, -y                do not ask questions
 #
@@ -65,11 +79,21 @@ REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/m
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
 
 DOMAIN=""
+HTTPS_PORT=""
+TLS_MODE=""
+TLS_CERT=""
+TLS_KEY=""
+TLS_DIR="/etc/caddy/wg-api-tls"
+TLS_FINGERPRINT=""
+TLS_PIN=""
+ACCESS_FILE="${API_ENV_DIR}/access.json"
+API_URL=""
 OUT_IFACE=""
 SERVER_PUBLIC_KEY=""
 API_TOKEN=""
 PORT_FROM_FLAG=0
 INSTALL_API=1
+INSTALL_CADDY=1
 ASSUME_YES=0
 FORCE=0
 ACTION="install"
@@ -95,7 +119,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 is_tty() { [ -t 0 ]; }
 
 # Usage: show_help       -> prints the header comment as help text
-show_help() { sed -n '2,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+show_help() { awk 'NR==2{next} /^# =+$/{exit} {print}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # ----------------------------- checks and arguments ---------------------------
 
@@ -123,10 +147,16 @@ parse_args() {
             --port=*)             WG_PORT="${a#*=}"; PORT_FROM_FLAG=1 ;;
             --api-port=*)         API_PORT_INTERNAL="${a#*=}" ;;
             --domain=*)           DOMAIN="${a#*=}" ;;
+            --https-port=*)       HTTPS_PORT="${a#*=}" ;;
+            --tls=*)              TLS_MODE="${a#*=}" ;;
+            --tls-cert=*)         TLS_CERT="${a#*=}" ;;
+            --tls-key=*)          TLS_KEY="${a#*=}" ;;
+            --reconfigure-api)    ACTION="reconfigure-api" ;;
             --dns=*)              CLIENT_DNS="${a#*=}" ;;
             --monitor-key=*)      MONITOR_KEY="${a#*=}" ;;
             --monitor-key-file=*) MONITOR_KEY_FILE="${a#*=}" ;;
             --no-api)             INSTALL_API=0 ;;
+            --no-caddy)           INSTALL_CADDY=0 ;;
             --force)              FORCE=1 ;;
             --yes|-y)             ASSUME_YES=1 ;;
             --uninstall|-u)       ACTION="uninstall" ;;
@@ -150,6 +180,17 @@ valid_monitor_key() {
 validate_settings() {
     valid_port "$WG_PORT"           || die "Invalid WireGuard port '$WG_PORT'."
     valid_port "$API_PORT_INTERNAL" || die "Invalid API port '$API_PORT_INTERNAL'."
+    if [ -n "$HTTPS_PORT" ]; then
+        valid_port "$HTTPS_PORT" || die "Invalid HTTPS port '$HTTPS_PORT'."
+    fi
+    case "$TLS_MODE" in
+        ""|selfsigned|letsencrypt) ;;
+        *) die "--tls must be 'selfsigned' or 'letsencrypt'." ;;
+    esac
+    if [ -n "${TLS_CERT}${TLS_KEY}" ]; then
+        { [ -r "$TLS_CERT" ] && [ -r "$TLS_KEY" ]; } || die "--tls-cert and --tls-key must both be given and readable."
+        TLS_MODE="custom"
+    fi
     [[ "$CLIENT_DNS" =~ ^[0-9.]+(,[[:space:]]?[0-9.]+)*$ ]] || die "Invalid --dns value '$CLIENT_DNS' (IPv4 addresses only)."
     if [ -n "$DOMAIN" ]; then
         [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "Invalid domain '$DOMAIN'."
@@ -189,12 +230,129 @@ ask_domain() {
     if [ -z "$DOMAIN" ]; then
         is_tty || die "A domain is required: pass --domain=NAME (or --no-api)."
         echo
-        echo "Automatic HTTPS (Let's Encrypt via Caddy) needs a domain whose A record"
-        echo "points to this server's public IP, and ports 80 and 443 open."
-        read -r -p "Enter domain (e.g. vpn-api.example.com): " DOMAIN
+        echo "Enter the domain (or public IP) clients will use to reach the API."
+        echo "A domain's A record should point to this server's public IP."
+        read -r -p "Domain or IP (e.g. vpn-api.example.com): " DOMAIN
     fi
     [ -n "$DOMAIN" ] || die "A domain is required (or use --no-api)."
     [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "Invalid domain '$DOMAIN'."
+}
+
+# Usage: port_in_use <port>  -> 0 if something is listening on that TCP port
+port_in_use() { [ -n "$(ss -H -ltn "sport = :$1" 2>/dev/null)" ]; }
+
+# Usage: port_owner <port>   -> names of the processes listening on that TCP port ("unknown" if hidden)
+port_owner() {
+    local o
+    o="$(ss -H -ltnp "sport = :$1" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ')"
+    o="${o% }"
+    printf '%s' "${o:-unknown}"
+}
+
+# Usage: port_usable <port>  -> 0 if the port is free, or held only by our own Caddy (a re-run)
+port_usable() { ! port_in_use "$1" || [[ "$(port_owner "$1")" == *caddy* ]]; }
+
+# Usage: https_port_problem <port> -> prints why the port cannot be used and returns 0; returns 1 when it is fine
+https_port_problem() {
+    local p="$1"
+    if ! valid_port "$p"; then echo "not a valid port"; return 0; fi
+    case "$p" in
+        22) echo "that is the SSH port"; return 0 ;;
+        80) echo "port 80 is plain HTTP and is not used by this installer"; return 0 ;;
+    esac
+    if [ "$p" -eq "$API_PORT_INTERNAL" ]; then echo "that is the internal API port"; return 0; fi
+    if ! port_usable "$p"; then echo "in use by $(port_owner "$p")"; return 0; fi
+    return 1
+}
+
+# Usage: ask_https_port -> scans the usual HTTPS ports and picks one: --https-port, a menu choice, or the first free one
+ask_https_port() {
+    [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ] || return 0
+    if ! have ss; then
+        apt-get update -y >/dev/null 2>&1 || true
+        apt-get install -y iproute2 >/dev/null 2>&1 || true
+    fi
+    have ss || die "'ss' (iproute2) is needed to check which ports are free."
+
+    if port_in_use "$API_PORT_INTERNAL" && ! systemctl is-active --quiet "$API_SERVICE" 2>/dev/null; then
+        die "Internal API port ${API_PORT_INTERNAL} is in use by $(port_owner "$API_PORT_INTERNAL"). Pass --api-port=N."
+    fi
+
+    local candidates=(443 8443 2053 2083 2087 2096 4443 9443) p i=0 default="" ans reason=""
+    if [ -n "$HTTPS_PORT" ]; then
+        if reason="$(https_port_problem "$HTTPS_PORT")"; then die "Cannot use HTTPS port ${HTTPS_PORT}: ${reason}."; fi
+        ok "HTTPS port ${HTTPS_PORT} is free"
+        return 0
+    fi
+
+    if [ "$ASSUME_YES" -eq 1 ] || ! is_tty; then
+        for p in "${candidates[@]}"; do
+            if ! https_port_problem "$p" >/dev/null; then HTTPS_PORT="$p"; break; fi
+        done
+        [ -n "$HTTPS_PORT" ] || die "None of the usual HTTPS ports (${candidates[*]}) is free. Pass --https-port=N, or use --no-caddy and proxy the API from the web server that owns 443."
+        say "Using HTTPS port ${HTTPS_PORT} (first free one)"
+        return 0
+    fi
+
+    echo
+    echo "HTTPS port for the management API (TCP):"
+    for p in "${candidates[@]}"; do
+        i=$((i+1))
+        if reason="$(https_port_problem "$p")"; then
+            printf '  %d) %-5s unavailable: %s\n' "$i" "$p" "$reason"
+        else
+            printf '  %d) %-5s free\n' "$i" "$p"
+            [ -n "$default" ] || default="$p"
+        fi
+    done
+    while :; do
+        if [ -n "$default" ]; then
+            read -r -p "Choose 1-${#candidates[@]}, type any port, or press Enter for ${default}: " ans
+        else
+            read -r -p "No usual port is free. Type a free port: " ans
+        fi
+        [ -n "$ans" ] || ans="$default"
+        if [ -z "$ans" ]; then echo "  Please enter a port."; continue; fi
+        if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "${#candidates[@]}" ]; then
+            ans="${candidates[$((ans-1))]}"
+        fi
+        if reason="$(https_port_problem "$ans")"; then echo "  Port ${ans} cannot be used: ${reason}."; continue; fi
+        HTTPS_PORT="$ans"
+        break
+    done
+    ok "HTTPS port ${HTTPS_PORT}"
+}
+
+# Usage: ask_tls_mode -> decides the certificate type: custom (own files), letsencrypt (443 only) or selfsigned (default)
+ask_tls_mode() {
+    [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ] || return 0
+    local ans=""
+    if [ -z "$TLS_MODE" ]; then
+        TLS_MODE="selfsigned"
+        if [ "$HTTPS_PORT" = "443" ] && [ "$ASSUME_YES" -ne 1 ] && is_tty; then
+            echo
+            echo "Port 443 can use a real Let's Encrypt certificate, but the validation needs"
+            echo "this server reachable from the internet on port 80 or 443 for the domain."
+            read -r -p "Use Let's Encrypt? [y/N]: " ans
+            if [[ "$ans" =~ ^[Yy]$ ]]; then TLS_MODE="letsencrypt"; fi
+        fi
+    fi
+    if [ "$TLS_MODE" = "letsencrypt" ] && [ "$HTTPS_PORT" != "443" ]; then
+        die "Let's Encrypt needs port 443 (validation cannot use ${HTTPS_PORT}). Use --tls=selfsigned or --https-port=443."
+    fi
+    if [ "$TLS_MODE" = "letsencrypt" ] && ! port_usable 80; then
+        die "Let's Encrypt through Caddy also needs port 80 free, but it is used by $(port_owner 80). Use --tls=selfsigned."
+    fi
+    ok "TLS mode: ${TLS_MODE}"
+}
+
+# Usage: compute_api_url -> sets API_URL (the port is omitted when it is 443 or Caddy is not used)
+compute_api_url() {
+    if [ -z "$HTTPS_PORT" ] || [ "$HTTPS_PORT" = "443" ]; then
+        API_URL="https://${DOMAIN}"
+    else
+        API_URL="https://${DOMAIN}:${HTTPS_PORT}"
+    fi
 }
 
 # Usage: ask_monitor_key -> asks for the wg-monitor public key (blank = skip)
@@ -235,7 +393,7 @@ step_install_packages() {
 
 # Usage: step_install_caddy -> Caddy from the official apt repo (skipped if already installed)
 step_install_caddy() {
-    [ "$INSTALL_API" -eq 1 ] || return 0
+    [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ] || return 0
     if have caddy; then ok "Caddy already installed"; return 0; fi
     say "Installing Caddy..."
     apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
@@ -243,6 +401,8 @@ step_install_caddy() {
     curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list
     apt-get update -y
     apt-get install -y caddy
+    # the package starts a default site on port 80; stop it until our own config is in place
+    systemctl disable --now caddy >/dev/null 2>&1 || true
     mkdir -p /var/log/caddy
     chown caddy:caddy /var/log/caddy
     ok "Caddy $(caddy version 2>/dev/null | head -n1)"
@@ -309,12 +469,13 @@ step_firewall_ufw() {
     ufw status 2>/dev/null | grep -qi 'Status: active' || return 0
     say "ufw is active: adding rules..."
     ufw allow "${WG_PORT}/udp" >/dev/null
-    if [ "$INSTALL_API" -eq 1 ]; then
-        ufw allow 80/tcp >/dev/null
-        ufw allow 443/tcp >/dev/null
+    local opened="${WG_PORT}/udp"
+    if [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ] && [ -n "$HTTPS_PORT" ]; then
+        ufw allow "${HTTPS_PORT}/tcp" >/dev/null
+        opened="${opened}, ${HTTPS_PORT}/tcp"
     fi
     ufw route allow in on "$WG_INTERFACE" out on "$OUT_IFACE" >/dev/null || true
-    ok "ufw: ${WG_PORT}/udp$([ "$INSTALL_API" -eq 1 ] && echo ', 80/tcp, 443/tcp') and routing for ${WG_INTERFACE}"
+    ok "ufw: ${opened} and routing for ${WG_INTERFACE} (port 80 is not opened)"
 }
 
 # Usage: step_start_wireguard -> enables and starts wg-quick@wg0 and checks the interface
@@ -956,16 +1117,56 @@ END
     ok "${API_SERVICE} started"
 }
 
-# Usage: step_configure_caddy -> Caddyfile with the reverse proxy; validated before Caddy is restarted
+# Usage: step_prepare_tls -> selfsigned: creates the certificate; custom: copies yours; sets TLS_FINGERPRINT and TLS_PIN
+step_prepare_tls() {
+    [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ] || return 0
+    TLS_FINGERPRINT=""
+    TLS_PIN=""
+    [ "$TLS_MODE" != "letsencrypt" ] || return 0
+    say "Preparing the TLS certificate (${TLS_MODE})..."
+    id caddy >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d /var/lib/caddy caddy
+    install -d -o caddy -g caddy -m 700 "$TLS_DIR"
+    local cert="${TLS_DIR}/cert.pem" key="${TLS_DIR}/key.pem" san
+    if [ "$TLS_MODE" = "custom" ]; then
+        install -o caddy -g caddy -m 644 "$TLS_CERT" "$cert"
+        install -o caddy -g caddy -m 600 "$TLS_KEY" "$key"
+        warn "Your certificate was COPIED to ${TLS_DIR}; it does not follow renewals. Re-run with --reconfigure-api --tls-cert=... --tls-key=... after each renewal."
+    else
+        if [[ "$DOMAIN" =~ ^[0-9.]+$ ]]; then san="IP:${DOMAIN}"; else san="DNS:${DOMAIN}"; fi
+        if [ ! -f "$cert" ] || ! openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -qF "${san#*:}"; then
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -sha256 -days 3650 \
+                -keyout "$key" -out "$cert" -subj "/CN=${DOMAIN}" -addext "subjectAltName=${san}" >/dev/null 2>&1 \
+                || die "Could not create the self-signed certificate (needs OpenSSL 1.1.1 or newer)."
+            chown caddy:caddy "$cert" "$key"
+            chmod 644 "$cert"
+            chmod 600 "$key"
+            ok "Created a self-signed certificate for ${DOMAIN} (valid 10 years)"
+        else
+            ok "Keeping the existing self-signed certificate for ${DOMAIN}"
+        fi
+    fi
+    TLS_FINGERPRINT="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 | sed 's/.*=//; s/://g')"
+    TLS_PIN="sha256//$(openssl x509 -in "$cert" -noout -pubkey | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl base64)"
+    ok "Certificate SHA-256: ${TLS_FINGERPRINT}"
+}
+
+# Usage: step_configure_caddy -> Caddyfile for the chosen port and TLS mode; validated before Caddy is restarted
 step_configure_caddy() {
-    [ "$INSTALL_API" -eq 1 ] || return 0
-    say "Configuring Caddy for ${DOMAIN}..."
+    [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ] || return 0
+    say "Configuring Caddy for ${DOMAIN} on port ${HTTPS_PORT} (TLS: ${TLS_MODE})..."
     mkdir -p /etc/caddy /var/log/caddy
     chown caddy:caddy /var/log/caddy 2>/dev/null || true
-    [ -f /etc/caddy/Caddyfile ] && ! grep -q 'install-wg-full.sh' /etc/caddy/Caddyfile \
-        && cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak-$(date +%Y%m%d-%H%M%S)"
-    cat > /etc/caddy/Caddyfile <<END
+    if [ -f /etc/caddy/Caddyfile ] && ! grep -q 'install-wg-full.sh' /etc/caddy/Caddyfile; then
+        cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak-$(date +%Y%m%d-%H%M%S)"
+    fi
+    if [ "$TLS_MODE" = "letsencrypt" ]; then
+        cat > /etc/caddy/Caddyfile <<END
 # managed by install-wg-full.sh
+{
+    # do not open a port-80 redirect listener
+    auto_https disable_redirects
+}
+
 ${DOMAIN} {
     reverse_proxy 127.0.0.1:${API_PORT_INTERNAL}
     log {
@@ -973,10 +1174,77 @@ ${DOMAIN} {
     }
 }
 END
+    else
+        cat > /etc/caddy/Caddyfile <<END
+# managed by install-wg-full.sh
+{
+    # the certificate is supplied below: no ACME, no redirects, nothing on port 80
+    auto_https off
+}
+
+https://${DOMAIN}:${HTTPS_PORT} {
+    tls ${TLS_DIR}/cert.pem ${TLS_DIR}/key.pem
+    reverse_proxy 127.0.0.1:${API_PORT_INTERNAL}
+    log {
+        output file /var/log/caddy/wg-api.log
+    }
+}
+END
+    fi
     caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 || die "Caddyfile does not validate: caddy validate --config /etc/caddy/Caddyfile"
     systemctl enable caddy >/dev/null 2>&1 || true
-    systemctl restart caddy
-    ok "Caddy proxies https://${DOMAIN} to 127.0.0.1:${API_PORT_INTERNAL}"
+    if ! systemctl restart caddy; then
+        journalctl -u caddy -n 15 --no-pager >&2 || true
+        die "Caddy failed to start. Is port ${HTTPS_PORT} really free? (ss -ltnp 'sport = :${HTTPS_PORT}')"
+    fi
+    compute_api_url
+    ok "Caddy proxies ${API_URL} to 127.0.0.1:${API_PORT_INTERNAL}"
+}
+
+# Usage: step_write_access_config -> saves the Outline-style {apiUrl, apiToken, certSha256} to /etc/wg-api/access.json (mode 600)
+step_write_access_config() {
+    [ "$INSTALL_API" -eq 1 ] || return 0
+    compute_api_url
+    have jq || apt-get install -y jq >/dev/null 2>&1
+    install -d -o root -g root -m 700 "$API_ENV_DIR"
+    ( umask 077; jq -n --arg u "$API_URL" --arg t "$API_TOKEN" --arg f "$TLS_FINGERPRINT" \
+        '{apiUrl: $u, apiToken: $t, certSha256: (if $f == "" then null else $f end)}' > "$ACCESS_FILE" )
+    chmod 600 "$ACCESS_FILE"
+    ok "Access config saved to ${ACCESS_FILE}"
+}
+
+# Usage: load_existing_settings -> reads domain, token, keys and ports from an existing install (for --reconfigure-api)
+load_existing_settings() {
+    [ -f "${API_DIR}/server.js" ] || die "No existing install found (${API_DIR}/server.js is missing). Run a normal install first."
+    if [ -z "$DOMAIN" ]; then
+        DOMAIN="$(sed -n "s/^const ENDPOINT = '\(.*\)';/\1/p" "${API_DIR}/server.js" | head -n1)"
+    fi
+    [ -n "$DOMAIN" ] || die "Could not read the domain from ${API_DIR}/server.js; pass --domain=NAME."
+    API_TOKEN="$(sed -n 's/^API_TOKEN=//p' "${API_ENV_DIR}/env" 2>/dev/null | head -n1)"
+    [ -n "$API_TOKEN" ] || die "Could not read the API token from ${API_ENV_DIR}/env."
+    SERVER_PUBLIC_KEY="$(cat /etc/wireguard/server_public.key 2>/dev/null || true)"
+    local lp ip
+    lp="$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$WG_CONFIG" 2>/dev/null | head -n1)"
+    if [ -n "$lp" ]; then WG_PORT="$lp"; fi
+    ip="$(sed -n 's/^app\.listen(\([0-9]*\),.*/\1/p' "${API_DIR}/server.js" | head -n1)"
+    if [ -n "$ip" ]; then API_PORT_INTERNAL="$ip"; fi
+}
+
+# Usage: reconfigure_api -> new HTTPS port / certificate for an existing install; WireGuard keys and peers are not touched
+reconfigure_api() {
+    INSTALL_API=1
+    INSTALL_CADDY=1
+    load_existing_settings
+    ask_https_port
+    ask_tls_mode
+    step_install_caddy
+    detect_outbound_interface
+    step_prepare_tls
+    step_firewall_ufw
+    step_configure_caddy
+    step_write_access_config
+    step_self_test
+    print_success_message
 }
 
 # Usage: fetch_tool <name> -> installs a repo script into /usr/local/bin (local copy first, else GitHub), syntax-checked
@@ -1043,6 +1311,16 @@ step_self_test() {
         curl -fsS -m 5 "http://127.0.0.1:${API_PORT_INTERNAL}/health" >/dev/null 2>&1 \
             && ok "wg-api answers on 127.0.0.1:${API_PORT_INTERNAL}" || warn "wg-api does not answer: journalctl -u ${API_SERVICE} -n 30"
     fi
+    if [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 1 ]; then
+        local code
+        code="$(curl -sk -m 8 --resolve "${DOMAIN}:${HTTPS_PORT}:127.0.0.1" -o /dev/null -w '%{http_code}' \
+            "https://${DOMAIN}:${HTTPS_PORT}/health" 2>/dev/null || true)"
+        if [ "$code" = "200" ]; then
+            ok "HTTPS endpoint answers on ${API_URL}"
+        else
+            warn "HTTPS check on port ${HTTPS_PORT} returned '${code:-no answer}': systemctl status caddy; journalctl -u caddy -n 30 --no-pager$([ "$TLS_MODE" = "letsencrypt" ] && echo " (Let's Encrypt may still be issuing the certificate)")"
+        fi
+    fi
 }
 
 # Usage: print_success_message -> final summary with the token and the next steps
@@ -1055,14 +1333,46 @@ print_success_message() {
     echo "  WireGuard port:  ${WG_PORT}/udp"
     echo "  Server pub key:  ${SERVER_PUBLIC_KEY}"
     if [ "$INSTALL_API" -eq 1 ]; then
-        echo "  API:             https://${DOMAIN}"
+        compute_api_url
+        local tlsopts=""
+        if [ "$INSTALL_CADDY" -eq 1 ]; then
+            echo "  API:             ${API_URL}"
+            echo "  HTTPS port:      ${HTTPS_PORT}/tcp   (TLS: ${TLS_MODE})"
+            if [ -n "$TLS_FINGERPRINT" ]; then
+                echo "  certSha256:      ${TLS_FINGERPRINT}"
+                tlsopts="--insecure --pinnedpubkey '${TLS_PIN}' "
+            fi
+        else
+            echo "  API:             http://127.0.0.1:${API_PORT_INTERNAL} (proxy it, see below)"
+        fi
         echo "  Bearer token:    ${API_TOKEN}   (stored in ${API_ENV_DIR}/env)"
         echo
+        echo "  Access config (Outline style, saved in ${ACCESS_FILE}):"
+        echo "    $(jq -c . "$ACCESS_FILE" 2>/dev/null || true)"
+        echo
         echo "  Create a client (add ?format=json for JSON):"
-        echo "    curl -X POST https://${DOMAIN}/create -H \"Authorization: Bearer ${API_TOKEN}\""
+        echo "    curl ${tlsopts}-X POST ${API_URL}/create -H \"Authorization: Bearer ${API_TOKEN}\""
         echo "  Remove a client:"
-        echo "    curl -X POST https://${DOMAIN}/remove -H \"Authorization: Bearer ${API_TOKEN}\" \\"
+        echo "    curl ${tlsopts}-X POST ${API_URL}/remove -H \"Authorization: Bearer ${API_TOKEN}\" \\"
         echo "      -H 'Content-Type: application/json' -d '{\"ipAddress\":\"10.66.66.2\"}'"
+        if [ -n "$tlsopts" ]; then
+            echo "  (the certificate is self-made: --pinnedpubkey checks it against the fingerprint above"
+            echo "   instead of a public CA; change port or certificate later with --reconfigure-api)"
+        fi
+    fi
+    if [ "$INSTALL_API" -eq 1 ] && [ "$INSTALL_CADDY" -eq 0 ]; then
+        cat <<END
+
+  Caddy was skipped. Add this inside the nginx server block for ${DOMAIN}
+  (vi /etc/nginx/sites-enabled/<your-site>), then: nginx -t && systemctl reload nginx
+
+    location ~ ^/(create|remove|health)\$ {
+        proxy_pass http://127.0.0.1:${API_PORT_INTERNAL};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+END
     fi
     echo
     echo "  Health tools:"
@@ -1081,6 +1391,8 @@ install_all() {
     echo "Starting the WireGuard installation..."
     ask_port
     ask_domain
+    ask_https_port
+    ask_tls_mode
     ask_monitor_key
     step_install_packages
     detect_outbound_interface
@@ -1097,9 +1409,11 @@ install_all() {
     step_generate_token
     step_write_server_js
     step_create_systemd_service
-    step_configure_caddy
     step_install_tools
     step_install_health_timer
+    step_prepare_tls
+    step_configure_caddy
+    step_write_access_config
     step_self_test
     print_success_message
 }
@@ -1176,6 +1490,7 @@ uninstall() {
     if grep -q 'install-wg-full.sh' /etc/caddy/Caddyfile 2>/dev/null; then
         systemctl disable --now caddy >/dev/null 2>&1 || true
         rm -f /etc/caddy/Caddyfile
+        rm -rf "$TLS_DIR"
     fi
     local rm_pkgs="n"
     if [ "$ASSUME_YES" -ne 1 ]; then
@@ -1201,14 +1516,16 @@ show_menu() {
     echo "  2) Uninstall"
     echo "  3) Add / repair the wg-monitor account"
     echo "  4) Update health tools (healthcheck, doctor)"
+    echo "  5) Change the API HTTPS port / certificate (keeps WireGuard keys and peers)"
     echo "  0) Exit"
     local choice
-    read -r -p "Choose [0-4]: " choice
+    read -r -p "Choose [0-5]: " choice
     case "$choice" in
         1) install_all ;;
         2) uninstall ;;
         3) ask_monitor_key; step_install_peer_ctrl; step_install_monitor ;;
         4) step_install_peer_ctrl; step_install_tools ;;
+        5) reconfigure_api ;;
         0) echo "Goodbye." ;;
         *) echo "Invalid choice." ;;
     esac
@@ -1230,6 +1547,7 @@ main() {
             step_install_monitor
             ;;
         update-tools) step_install_peer_ctrl; step_install_tools ;;
+        reconfigure-api) reconfigure_api ;;
         install)
             if [ "$argc" -eq 0 ] && is_tty; then show_menu; else install_all; fi
             ;;
