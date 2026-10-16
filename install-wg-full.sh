@@ -22,6 +22,8 @@
 #                                                    existing install (WireGuard keys untouched)
 #   sudo ./install-wg-full.sh --add-monitor --monitor-key-file=/root/wg_monitor_key.pub
 #   sudo ./install-wg-full.sh --update-tools         re-fetch healthcheck/doctor scripts
+#   sudo ./install-wg-full.sh --update-api           rewrite wg-api-helper and server.js to this
+#                                                    script's version (adds /usage); keys/peers untouched
 #   sudo ./install-wg-full.sh --uninstall
 #
 # Options:
@@ -163,6 +165,7 @@ parse_args() {
             --uninstall|-u)       ACTION="uninstall" ;;
             --add-monitor)        ACTION="add-monitor" ;;
             --update-tools)       ACTION="update-tools" ;;
+            --update-api)         ACTION="update-api" ;;
             --help|-h)            show_help; exit 0 ;;
             *) echo "Unknown argument: $a" >&2; show_help; exit 1 ;;
         esac
@@ -818,6 +821,7 @@ step_install_api_helper() {
 #   wg-api-helper used-ips              last octets already used in 10.66.66.0/24
 #   wg-api-helper add <pubkey> <ip>     add a peer to wg0.conf AND the live interface
 #   wg-api-helper remove <ip>           remove a peer from wg0.conf AND the live interface
+#   wg-api-helper usage [<ip>]          traffic counters: one line per peer 'ip<TAB>rx<TAB>tx<TAB>handshake'
 set -euo pipefail
 
 WG_IF="wg0"
@@ -899,6 +903,18 @@ cmd_remove() {
     echo "OK: peer removed ($ip)"
 }
 
+# Usage: cmd_usage [<ip>]       -> 'ip<TAB>bytes_from_client<TAB>bytes_to_client<TAB>last_handshake_epoch' per peer (read-only)
+cmd_usage() {
+    local want="${1:-}"
+    if [ -n "$want" ]; then is_valid_ip "$want" || fail "invalid ip"; fi
+    wg show "$WG_IF" dump 2>/dev/null | awk -F'\t' -v want="$want" '
+        NR == 1 { next }
+        { ip = $4; sub(/\/.*/, "", ip)
+          if (want != "" && ip != want) next
+          printf "%s\t%s\t%s\t%s\n", ip, $6, $7, $5 }
+    ' || true
+}
+
 exec 9>/run/wg-api-helper.lock
 flock 9
 
@@ -906,6 +922,7 @@ case "${1:-}" in
     used-ips) [ "$#" -eq 1 ] || fail "usage: used-ips";           cmd_used_ips ;;
     add)      [ "$#" -eq 3 ] || fail "usage: add <pubkey> <ip>";  cmd_add "$2" "$3" ;;
     remove)   [ "$#" -eq 2 ] || fail "usage: remove <ip>";        cmd_remove "$2" ;;
+    usage)    [ "$#" -le 2 ] || fail "usage: usage [<ip>]";       cmd_usage "${2:-}" ;;
     *)        fail "command not permitted: ${1:-<empty>}" ;;
 esac
 WG_API_HELPER_EOF
@@ -1083,6 +1100,55 @@ app.post('/remove', (req, res) => {
     }
 });
 
+// Usage: parseUsage(text) -> [{ ipAddress, uploadBytes, downloadBytes, lastHandshake }]
+// "upload" and "download" are from the client's point of view (server rx = client upload).
+function parseUsage(text) {
+    return text.split('\n').filter(Boolean).map(line => {
+        const f = line.split('\t');
+        const up = parseInt(f[1], 10) || 0, down = parseInt(f[2], 10) || 0, hs = parseInt(f[3], 10) || 0;
+        return {
+            ipAddress: f[0],
+            uploadBytes: up,
+            downloadBytes: down,
+            totalBytes: up + down,
+            lastHandshake: hs ? new Date(hs * 1000).toISOString() : null
+        };
+    });
+}
+
+// GET /usage        -> { interface, timestamp, totals, keys: [ per-key usage ] }
+// GET /usage/:ip    -> usage of one key, e.g. /usage/10.66.66.5
+// Counters come from the kernel and reset when wg0 restarts or the server reboots.
+app.get('/usage', (req, res) => {
+    try {
+        const keys = parseUsage(helper(['usage']));
+        const totals = keys.reduce((t, k) => ({
+            uploadBytes: t.uploadBytes + k.uploadBytes,
+            downloadBytes: t.downloadBytes + k.downloadBytes,
+            totalBytes: t.totalBytes + k.totalBytes
+        }), { uploadBytes: 0, downloadBytes: 0, totalBytes: 0 });
+        res.json({ interface: 'wg0', timestamp: new Date().toISOString(), totals, keys });
+    } catch (err) {
+        console.error('usage failed:', err.message);
+        res.status(500).json({ error: 'usage failed' });
+    }
+});
+
+app.get('/usage/:ip', (req, res) => {
+    const ip = req.params.ip.split('/')[0];
+    if (!/^10\.66\.66\.[1-9][0-9]{0,2}$/.test(ip)) {
+        return res.status(400).json({ error: 'invalid ip' });
+    }
+    try {
+        const keys = parseUsage(helper(['usage', ip]));
+        if (keys.length === 0) return res.status(404).json({ error: 'no such key' });
+        res.json(keys[0]);
+    } catch (err) {
+        console.error('usage failed:', err.message);
+        res.status(500).json({ error: 'usage failed' });
+    }
+});
+
 app.listen(__API_PORT__, '127.0.0.1', () => {
     console.log('wg-api listening on 127.0.0.1:__API_PORT__');
 });
@@ -1248,6 +1314,21 @@ load_existing_settings() {
     if [ -n "$lp" ]; then WG_PORT="$lp"; fi
     ip="$(sed -n 's/^app\.listen(\([0-9]*\),.*/\1/p' "${API_DIR}/server.js" | head -n1)"
     if [ -n "$ip" ]; then API_PORT_INTERNAL="$ip"; fi
+}
+
+# Usage: update_api -> rewrites wg-api-helper and server.js (new endpoints) and restarts wg-api; keys, peers, token and TLS are kept
+update_api() {
+    INSTALL_API=1
+    load_existing_settings
+    local d
+    d="$(sed -n "s/^const CLIENT_DNS = '\(.*\)';/\1/p" "${API_DIR}/server.js" | head -n1)"
+    if [ -n "$d" ]; then CLIENT_DNS="$d"; fi
+    step_install_api_helper
+    step_write_server_js
+    systemctl restart wg-api || die "wg-api failed to restart: journalctl -u wg-api -n 30"
+    sleep 1
+    systemctl is-active --quiet wg-api || die "wg-api is not running: journalctl -u wg-api -n 30"
+    ok "wg-api updated (GET /usage and /usage/<ip> available)"
 }
 
 # Usage: reconfigure_api -> new HTTPS port / certificate for an existing install; WireGuard keys and peers are not touched
@@ -1570,6 +1651,7 @@ main() {
             ;;
         update-tools) step_install_peer_ctrl; step_install_tools ;;
         reconfigure-api) reconfigure_api ;;
+        update-api)   update_api ;;
         install)
             if [ "$argc" -eq 0 ] && is_tty; then show_menu; else install_all; fi
             ;;
