@@ -1,63 +1,175 @@
 # Arkh91_WireGuard
 
-Custom WireGuard VPS installer with a Node.js/Caddy management API and a
-restricted SSH account (`wg-monitor`) that lets a central management server
-(e.g. "US08") pull traffic stats and enforce peer limits.
+Custom WireGuard VPS installer with an HTTPS management API (Node.js behind
+Caddy), health tooling, and a restricted SSH account (`wg-monitor`) that lets
+a central management server (e.g. "US08") pull traffic stats and enforce peer
+limits.
+
+`install-wg-full.sh` is the installer to use. It sets up everything in one
+run: WireGuard, the API, the health tools, a daily health-check timer, and
+(optionally) the `wg-monitor` account.
 
 ---
 
-## ✅ How you'll run it
+## Install
+
+Run it directly from GitHub (arguments go **after** the closing `)`):
 
 ```bash
-./install-wg3.sh
+bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh)
 
+# non-interactive example
+bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh) \
+    --domain=vpn.example.com --port=39022 --https-port=2053 --yes
+```
+
+or from a local copy: `sudo ./install-wg-full.sh`.
+
+Putting a flag *before* the closing `)` (for example `curl -Ls <url> --add-monitor`)
+does not work: `curl` parses it as its own option and rejects it.
+
+During an interactive install you are asked for:
+1. A **domain** for the management API.
+2. A **WireGuard UDP port**.
+3. The **HTTPS port** of the API. The installer scans which of the Cloudflare-proxied
+   HTTPS ports (443, 8443, 2053, 2083, 2087, 2096) are free and lets you pick one.
+   Nothing ever listens on port 80.
+4. The **TLS mode** (see below).
+5. The management server's **`wg-monitor` public key**
+   (contents of `/root/.ssh/wg_monitor_key.pub` on US08, see [below](#1-generate-the-key-once-on-us08)).
+   Leave it blank to skip and add it later.
+
+At the end it prints **WIREGUARD SERVER INSTALLED** with the API URL, HTTPS port,
+Bearer token, certificate fingerprint and ready-to-copy commands. The same access
+details are saved in `/etc/wg-api/access.json`:
+
+```json
+{ "apiUrl": "https://vpn.example.com:2053", "apiToken": "...", "certSha256": "..." }
+```
+
+### Options
+
+| Flag | Meaning |
+|---|---|
+| `--domain=NAME` | domain (or IP) clients use to reach the API |
+| `--port=N` | WireGuard UDP port (default 51820) |
+| `--https-port=N` | public HTTPS port of the API (443, 8443, 2053, 2083, 2087, 2096; asked if omitted) |
+| `--tls=selfsigned\|letsencrypt` | `selfsigned` (default, pinned by fingerprint); `letsencrypt` only with `--https-port=443` |
+| `--tls-cert=FILE --tls-key=FILE` | use your own certificate (copied, does not follow renewals) |
+| `--api-port=N` | internal API port (default 4242, localhost only) |
+| `--dns=IP[,IP]` | DNS handed to clients (default 1.1.1.1) |
+| `--monitor-key="ssh-..."` / `--monitor-key-file=FILE` | `wg-monitor` public key of the management server |
+| `--no-api` | WireGuard + tools only, no Caddy/Node/API |
+| `--no-caddy` | install the API but not Caddy (when nginx or another web server already owns 80/443) |
+| `--force` | replace an existing `wg0.conf` (a backup is made first) |
+| `--yes`, `-y` | do not ask questions |
+
+### Other actions
+
+```bash
+sudo ./install-wg-full.sh --add-monitor --monitor-key-file=/root/wg_monitor_key.pub  # add/repair wg-monitor on an installed node
+sudo ./install-wg-full.sh --reconfigure-api   # change the API HTTPS port / certificate (WireGuard keys and peers untouched)
+sudo ./install-wg-full.sh --update-api        # rewrite wg-api-helper and server.js to the current version (adds /usage); keys and peers untouched
+sudo ./install-wg-full.sh --update-tools      # re-fetch wg-healthcheck.sh and vpn-doctor.sh
+sudo ./install-wg-full.sh --uninstall         # remove everything this script installed
+```
+
+`--add-monitor` is the one to use for a node set up before the account existed,
+or where SSH asks for a password instead of using the key.
+
+---
+
+## Management API
+
+All endpoints except `/health` need the header `Authorization: Bearer <apiToken>`.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /create` | create a key; returns the client config as text (`?format=json` for JSON) |
+| `POST /remove` | remove a key, body `{"ipAddress":"10.66.66.2"}` |
+| `GET /usage` | **all keys**: upload/download bytes, last handshake, plus totals |
+| `GET /usage/<ip>` | usage of **one key**, e.g. `/usage/10.66.66.2` |
+| `GET /health` | liveness check, no token needed |
+
+A key is identified by its IP address (`10.66.66.x`).
+
+```bash
+# self-signed certificate: pin the public key instead of trusting a CA
+PIN='sha256//<base64 pin, printed at the end of the install>'
+TOKEN='<apiToken from /etc/wg-api/access.json>'
+URL='https://vpn.example.com:2053'
+
+curl --insecure --pinnedpubkey "$PIN" -X POST "$URL/create" -H "Authorization: Bearer $TOKEN"
+curl --insecure --pinnedpubkey "$PIN" "$URL/usage"          -H "Authorization: Bearer $TOKEN"
+curl --insecure --pinnedpubkey "$PIN" "$URL/usage/10.66.66.2" -H "Authorization: Bearer $TOKEN"
+```
+
+`GET /usage` response:
+
+```json
+{
+  "interface": "wg0",
+  "timestamp": "2026-10-16T09:13:41.825Z",
+  "totals": { "uploadBytes": 1048576, "downloadBytes": 2097152, "totalBytes": 3145728 },
+  "keys": [
+    { "ipAddress": "10.66.66.2", "uploadBytes": 1048576, "downloadBytes": 2097152,
+      "totalBytes": 3145728, "lastHandshake": "2026-10-16T09:10:00.000Z" }
+  ]
+}
+```
+
+* `uploadBytes` / `downloadBytes` are from the **client's** point of view
+  (upload = what the client sent to the server).
+* `lastHandshake` is `null` for a key that has never connected.
+* The counters come from the kernel and **reset when `wg0` restarts or the server
+  reboots**. A script that tracks monthly totals should poll regularly and treat a
+  decrease as a reset.
+* To collect usage from several servers, keep each server's domain, HTTPS port,
+  token and pin (all in its `access.json`) and poll `/usage` on each.
+
+### TLS modes and ports
+
+* **selfsigned** (default): the certificate is made on the server and clients pin
+  it, like Outline's `certSha256`. Works on any free HTTPS port.
+  The curl pin is computed with:
+  ```bash
+  openssl x509 -in /etc/caddy/wg-api-tls/cert.pem -pubkey -noout \
+    | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
+  ```
+  (a new certificate, and therefore a new pin, is created on every fresh install).
+* **letsencrypt**: only on port 443, because validation needs the internet to reach 80 or 443.
+* **Behind the Cloudflare proxy** (orange cloud) clients see Cloudflare's certificate:
+  drop `--insecure`/`--pinnedpubkey` and set SSL/TLS mode to **Full**.
+  Cloudflare only proxies the HTTPS ports 443, 2053, 2083, 2087, 2096 and 8443.
+
+---
+
+## Health tools
+
+Installed in `/usr/local/bin` and also runnable straight from GitHub:
+
+```bash
+sudo wg-healthcheck.sh [--capture=20]      # health check (also runs daily from a systemd timer)
+sudo vpn-doctor.sh [--fix] [--dry-run]     # diagnose and fix
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/wg-healthcheck.sh)
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/vpn-interference-check.sh)
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/vpn-doctor.sh)
 ```
 
-or, run directly from GitHub without downloading first:
+Enforcement actions are logged: `journalctl -t wg-peer-ctrl -f`.
 
-```bash
-# Standard port
-bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg3.sh)
+---
 
-# Custom port
-bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install_wg_custom_port.sh)
-```
+## Troubleshooting
 
-Anything after the closing `)` is passed straight through to the script as
-its own arguments, so `--add-monitor` (or `--uninstall`, `--port=...`, etc.)
-works the same way here as it does on a local copy:
-
-```bash
-# Add/repair wg-monitor on a node installed this way, without a full reinstall
-bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg3.sh) --add-monitor
-```
-
-Putting `--add-monitor` (or any flag) *before* the closing `)` — e.g.
-`curl -Ls <url> --add-monitor` — won't work: `curl` parses it as its own
-option, not the script's, and rejects it as unrecognized.
-
-During interactive install you'll be asked for:
-1. A domain (for the HTTPS management API via Caddy)
-2. A WireGuard UDP port
-3. **The management server's `wg-monitor` public key** (paste the contents of
-   `/root/.ssh/wg_monitor_key.pub` from US08 — see [below](#1-generate-the-key-once-on-us08)).
-   Leave this blank to skip and add it later.
-
-Other entry points:
-
-```bash
-sudo ./install-wg3.sh --uninstall      # remove everything this script installed
-sudo ./install-wg3.sh --add-monitor    # add/repair wg-monitor on an ALREADY-installed node
-sudo ./install-wg3.sh --port=51830     # custom WireGuard port
-sudo ./install-wg3.sh --api-port=4000  # custom internal API port
-```
-
-`--add-monitor` is the one you want for any node that was set up before this
-account existed, or where SSH is currently asking for a password instead of
-using the key.
+* **`curl: (7) Failed to connect`**: wrong port or Caddy is down. Check the port in
+  `/etc/wg-api/access.json`, then `systemctl is-active caddy wg-api` and
+  `ss -ltnp | grep -E 'caddy|node'`.
+* **`curl: (90) SSL: public key does not match pinned public key`**: the pin is from
+  an older install, or a placeholder was left in the command. Recompute it (above).
+* **`Cannot GET /usage`**: the server still runs an older `server.js`; run `--update-api`.
+* **Caddy: `permission denied` on `/var/log/caddy/wg-api.log`**: fixed in the current
+  installer; on an old install run `chown -R caddy:caddy /var/log/caddy && systemctl restart caddy`.
 
 ---
 
@@ -68,7 +180,7 @@ send enforcement commands (disable/enable/suspend/unsuspend/speed-limit)
 over SSH, without ever giving it a real login on the VPN node.
 
 As of this version, **all of the setup below is automated** by
-`install-wg3.sh` (either during install, or via `--add-monitor` on an
+`install-wg-full.sh` (either during install, or via `--add-monitor` on an
 existing node). This section documents what it does and why, both so you
 can verify it and so you can do it by hand if you're ever working on a node
 without the installer.
