@@ -1456,6 +1456,11 @@ print_success_message() {
         echo "  Remove a client:"
         echo "    curl ${tlsopts}-X POST ${API_URL}/remove -H \"Authorization: Bearer ${API_TOKEN}\" \\"
         echo "      -H 'Content-Type: application/json' -d '{\"ipAddress\":\"10.66.66.2\"}'"
+        echo "  List ALL keys with upload/download (bytes) and last handshake:"
+        echo "    curl ${tlsopts}${API_URL}/usage -H \"Authorization: Bearer ${API_TOKEN}\""
+        echo "  Usage of ONE key (by its IP address):"
+        echo "    curl ${tlsopts}${API_URL}/usage/10.66.66.2 -H \"Authorization: Bearer ${API_TOKEN}\""
+        echo "  (upload/download are from the client's point of view; counters reset when wg0 or the server restarts)"
         if [ -n "$tlsopts" ]; then
             echo "  (the certificate is self-made: --pinnedpubkey checks it against the fingerprint above"
             echo "   instead of a public CA; change port or certificate later with --reconfigure-api)"
