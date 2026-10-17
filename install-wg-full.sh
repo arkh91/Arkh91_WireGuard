@@ -3,7 +3,8 @@
 # install-wg-full.sh - WireGuard server + HTTPS management API + health tooling
 #
 # Installs on Debian/Ubuntu:
-#   - WireGuard (wg0, 10.66.66.0/24) with NAT/forward rules in PostUp/PostDown
+#   - WireGuard (wg0, 10.66.0.0/16 = about 65,000 keys; --network253 for 10.66.66.0/24 = 253 keys)
+#     with NAT/forward rules in PostUp/PostDown
 #     (survive reboots) and ip_forward persisted in /etc/sysctl.d
 #   - wg-api  (Node.js, localhost only) behind Caddy on an HTTPS port YOU choose
 #     (the installer scans for free ports) with a Bearer token:
@@ -40,6 +41,8 @@
 #   --tls-cert=FILE --tls-key=FILE
 #                            use your own certificate (copied; does not follow renewals)
 #   --api-port=N             internal API port (default 4242)
+#   --network253            use 10.66.66.0/24 (253 keys, the old install-wg3.sh pool) instead of the
+#                            default 10.66.0.0/16 (about 65,000 keys)
 #   --dns=IP[,IP]            DNS handed to clients (default 1.1.1.1)
 #   --monitor-key="ssh-..."  public key of the management server (wg-monitor)
 #   --monitor-key-file=FILE  same, read from a file
@@ -60,9 +63,8 @@ set -euo pipefail
 # ----------------------------- settings ---------------------------------------
 WG_INTERFACE="wg0"
 WG_PORT=51820
-WG_NETWORK="10.66.66.0/24"
-WG_SERVER_ADDR="10.66.66.1/24"
-WG_NET_PREFIX="10.66.66."
+WG_NETWORK="10.66.0.0/16"        # default pool: about 65,000 keys (--network253 selects 10.66.66.0/24)
+WG_SERVER_ADDR="10.66.0.1/16"
 WG_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
 CLIENT_DNS="1.1.1.1"
 
@@ -90,6 +92,11 @@ TLS_DIR="/etc/caddy/wg-api-tls"
 TLS_FINGERPRINT=""
 TLS_PIN=""
 ACCESS_FILE="${API_ENV_DIR}/access.json"
+# how to call this script again in printed hints: run through 'bash <(curl ...)' $0 is /dev/fd/NN
+case "$0" in
+    /dev/fd/*|/proc/*) SELF_CMD="bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh)" ;;
+    *)                 SELF_CMD="$0" ;;
+esac
 API_URL=""
 OUT_IFACE=""
 SERVER_PUBLIC_KEY=""
@@ -128,7 +135,7 @@ show_help() { awk 'NR==2{next} /^# =+$/{exit} {print}' "${BASH_SOURCE[0]}" | sed
 
 # Usage: check_root      -> exits unless running as root
 check_root() {
-    [ "$EUID" -eq 0 ] || die "This script must be run as root (sudo $0)."
+    [ "$EUID" -eq 0 ] || die "This script must be run as root (sudo ${SELF_CMD})."
 }
 
 # Usage: check_os        -> exits unless the OS is Debian or Ubuntu based
@@ -164,6 +171,7 @@ parse_args() {
             --yes|-y)             ASSUME_YES=1 ;;
             --uninstall|-u)       ACTION="uninstall" ;;
             --add-monitor)        ACTION="add-monitor" ;;
+            --network253)         WG_NETWORK="10.66.66.0/24"; WG_SERVER_ADDR="10.66.66.1/24" ;;
             --update-tools)       ACTION="update-tools" ;;
             --update-api)         ACTION="update-api" ;;
             --help|-h)            show_help; exit 0 ;;
@@ -534,11 +542,11 @@ step_install_peer_ctrl() {
 #   peer-setlimit  <cidr> <kbps>  -> tc htb cap, both directions
 #   peer-clearlimit <cidr>        -> remove tc cap
 #
-# NOTE on speed limiting: this assumes every peer's address comes from a
-# single flat /24 pool (10.66.66.0/24, per install-wg3.sh's getNextIP()),
-# and uses the address's last octet as the tc classid. If you ever run
-# peers across multiple pools/subnets on one server, this needs a real
-# classid allocator instead.
+# NOTE on speed limiting: every peer's address must come from ONE flat pool
+# (a /24 or the default 10.66.0.0/16). The tc classid is the hex value of
+# (third octet * 256 + fourth octet), which is unique inside any pool up to a
+# /16 (minor ids 1..fffe). 1:ffff is the unlimited default class. If you ever run
+# peers across several pools on one server, this needs a real allocator.
 
 set -euo pipefail
 
@@ -603,18 +611,19 @@ persist_iptables() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Usage: class_id_for_ip <cidr>
-# Derives a stable tc classid from the last octet of the peer's IP.
+# Derives a stable tc classid (hex, as tc expects) from the third and fourth octet of the peer's IP.
 class_id_for_ip() {
-    local ip="${1%%/*}" last_octet="${1%%/*}"
-    last_octet="${ip##*.}"
-    [[ "$last_octet" =~ ^[0-9]+$ ]] || return 1
-    echo "$last_octet"
+    local ip="${1%%/*}" a b c d
+    IFS=. read -r a b c d <<<"$ip"
+    [[ "$c" =~ ^[0-9]{1,3}$ && "$d" =~ ^[0-9]{1,3}$ ]] || return 1
+    [ "$((10#$c))" -le 255 ] && [ "$((10#$d))" -le 255 ] || return 1
+    printf '%x' $(( 10#$c * 256 + 10#$d ))
 }
 
 # Usage: ensure_shaping_setup
 # One-time (idempotent) setup: ifb device, wg0->ifb0 ingress redirect,
 # and a root htb qdisc on both devices with an unlimited default class
-# (1:999) so peers with no cap are unaffected.
+# (1:ffff) so peers with no cap are unaffected.
 ensure_shaping_setup() {
     ip link show "$IFB_IFACE" &>/dev/null || {
         modprobe ifb numifbs=1 2>/dev/null || true
@@ -629,12 +638,12 @@ ensure_shaping_setup() {
     }
 
     "$TC" qdisc show dev "$WG_IFACE" | grep -q "htb 1:" || {
-        "$TC" qdisc add dev "$WG_IFACE" root handle 1: htb default 999
-        "$TC" class add dev "$WG_IFACE" parent 1: classid 1:999 htb rate 1000mbit
+        "$TC" qdisc add dev "$WG_IFACE" root handle 1: htb default ffff
+        "$TC" class add dev "$WG_IFACE" parent 1: classid 1:ffff htb rate 1000mbit
     }
     "$TC" qdisc show dev "$IFB_IFACE" | grep -q "htb 1:" || {
-        "$TC" qdisc add dev "$IFB_IFACE" root handle 1: htb default 999
-        "$TC" class add dev "$IFB_IFACE" parent 1: classid 1:999 htb rate 1000mbit
+        "$TC" qdisc add dev "$IFB_IFACE" root handle 1: htb default ffff
+        "$TC" class add dev "$IFB_IFACE" parent 1: classid 1:ffff htb rate 1000mbit
     }
 }
 
@@ -818,7 +827,8 @@ step_install_api_helper() {
 #!/bin/bash
 # wg-api-helper - root-owned helper for wg-api. Called through sudo; it is the
 # only thing the API user may run as root and it accepts only these commands:
-#   wg-api-helper used-ips              last octets already used in 10.66.66.0/24
+#   wg-api-helper used-ips              every client address already in wg0.conf
+#   wg-api-helper add-auto <pubkey>     pick the first free address, add the peer, print the address
 #   wg-api-helper add <pubkey> <ip>     add a peer to wg0.conf AND the live interface
 #   wg-api-helper remove <ip>           remove a peer from wg0.conf AND the live interface
 #   wg-api-helper usage [<ip>]          traffic counters: one line per peer 'ip<TAB>rx<TAB>tx<TAB>handshake'
@@ -837,11 +847,34 @@ fail() { echo "ERROR: $*" >&2; logger -t wg-api-helper "result=DENY $*"; exit 1;
 # Usage: is_valid_pubkey <key>  -> base64, 44 chars ending in '='
 is_valid_pubkey() { [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
 
-# Usage: is_valid_ip <ip>       -> 0 for 10.66.66.2 to 10.66.66.254 (no leading zeros)
+# Usage: ip2int a.b.c.d         -> sets REPLY to the address as an integer (no subshell, fast for big pools)
+ip2int() { local IFS=.; local -a o; read -r -a o <<<"$1"; REPLY=$(( (o[0]<<24) + (o[1]<<16) + (o[2]<<8) + o[3] )); }
+
+# Usage: int2ip <int>           -> prints a.b.c.d
+int2ip() { echo "$(( ($1>>24)&255 )).$(( ($1>>16)&255 )).$(( ($1>>8)&255 )).$(( $1&255 ))"; }
+
+# Usage: load_network           -> reads the server Address from wg0.conf (any prefix, e.g. /16 or /24) into
+#                                  SRV_INT, NET_INT, BCAST_INT
+load_network() {
+    local addr p mask
+    addr="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*\([0-9.]*\/[0-9]*\).*/\1/p' "$WG_CONF" | head -n1)"
+    [ -n "$addr" ] || fail "cannot read the Address line from $WG_CONF"
+    p="${addr#*/}"
+    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 8 ] && [ "$p" -le 30 ] || fail "unsupported network prefix in $WG_CONF"
+    ip2int "${addr%/*}"; SRV_INT="$REPLY"
+    mask=$(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF ))
+    NET_INT=$(( SRV_INT & mask ))
+    BCAST_INT=$(( NET_INT | (~mask & 0xFFFFFFFF) ))
+}
+
+# Usage: is_valid_ip <ip>       -> 0 for a client address inside the server's network
+#                                  (not the network address, broadcast or the server itself); no leading zeros
 is_valid_ip() {
-    [[ "$1" =~ ^10\.66\.66\.([1-9][0-9]{0,2})$ ]] || return 1
-    local n="${BASH_REMATCH[1]}"
-    [ "$n" -ge 2 ] && [ "$n" -le 254 ]
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$ ]] || return 1
+    local o
+    for o in ${1//./ }; do [ "$o" -le 255 ] || return 1; done
+    ip2int "$1"
+    [ "$REPLY" -gt "$NET_INT" ] && [ "$REPLY" -lt "$BCAST_INT" ] && [ "$REPLY" -ne "$SRV_INT" ]
 }
 
 # Usage: install_conf <file>    -> validates with wg-quick strip, then atomically replaces wg0.conf
@@ -860,9 +893,24 @@ peer_key_for_ip() {
     ' "$WG_CONF"
 }
 
-# Usage: cmd_used_ips           -> prints the last octet of every 10.66.66.x address in the config
+# Usage: cmd_used_ips           -> prints every client address (AllowedIPs x.x.x.x/32) in the config
 cmd_used_ips() {
-    grep -oE '10\.66\.66\.[0-9]+' "$WG_CONF" | sed 's/.*\.//' | sort -un || true
+    grep -E '^AllowedIPs[[:space:]]*=[[:space:]]*[0-9.]+/32' "$WG_CONF" | grep -oE '[0-9.]+/32' | sed 's#/32$##' || true
+}
+
+# Usage: next_free_ip           -> prints the first free address of the pool, returns 1 when it is full
+next_free_ip() {
+    local -A used=()
+    local ip i
+    while read -r ip; do
+        [ -n "$ip" ] || continue
+        ip2int "$ip"; used[$REPLY]=1
+    done < <(cmd_used_ips)
+    for (( i = NET_INT + 1; i < BCAST_INT; i++ )); do
+        [ "$i" -eq "$SRV_INT" ] && continue
+        if [ -z "${used[$i]:-}" ]; then int2ip "$i"; return 0; fi
+    done
+    return 1
 }
 
 # Usage: cmd_add <pubkey> <ip>  -> adds the peer to the file first, then to the live interface
@@ -915,12 +963,23 @@ cmd_usage() {
     ' || true
 }
 
+# Usage: cmd_add_auto <pubkey>  -> picks the first free address and adds the peer under the same lock; prints the address
+cmd_add_auto() {
+    local pub="$1" ip
+    is_valid_pubkey "$pub" || fail "invalid public key"
+    ip="$(next_free_ip)" || fail "IP pool exhausted"
+    cmd_add "$pub" "$ip" >/dev/null
+    echo "$ip"
+}
+
 exec 9>/run/wg-api-helper.lock
 flock 9
+load_network
 
 case "${1:-}" in
     used-ips) [ "$#" -eq 1 ] || fail "usage: used-ips";           cmd_used_ips ;;
     add)      [ "$#" -eq 3 ] || fail "usage: add <pubkey> <ip>";  cmd_add "$2" "$3" ;;
+    add-auto) [ "$#" -eq 2 ] || fail "usage: add-auto <pubkey>";  cmd_add_auto "$2" ;;
     remove)   [ "$#" -eq 2 ] || fail "usage: remove <ip>";        cmd_remove "$2" ;;
     usage)    [ "$#" -le 2 ] || fail "usage: usage [<ip>]";       cmd_usage "${2:-}" ;;
     *)        fail "command not permitted: ${1:-<empty>}" ;;
@@ -997,7 +1056,7 @@ app.use(helmet());
 app.use(express.json());
 app.use(rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 60,
+    limit: 600,   // 40/min: room for a manager polling /usage every minute (the token is 256-bit, brute force is not a concern)
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many requests, please try again later.' }
@@ -1013,7 +1072,6 @@ if (API_TOKEN.length < 32) {
 const SERVER_PUB = '__SERVER_PUB__';
 const ENDPOINT = '__ENDPOINT__';
 const WG_PORT = __WG_PORT__;
-const BASE_IP = '__NET_PREFIX__';
 const CLIENT_DNS = '__DNS__';
 const HELPER = '/usr/local/bin/wg-api-helper';
 
@@ -1029,14 +1087,18 @@ function helper(args) {
     return execFileSync('sudo', ['-n', HELPER, ...args], { encoding: 'utf8' });
 }
 
-// Usage: getNextIP() -> first free 10.66.66.x (2..254), throws when the pool is exhausted
-function getNextIP() {
-    const used = helper(['used-ips']).split('\n').map(s => parseInt(s, 10)).filter(n => !Number.isNaN(n));
-    for (let i = 2; i <= 254; i++) {
-        if (!used.includes(i)) return BASE_IP + i;
-    }
-    throw new Error('IP pool exhausted');
+// Usage: helperFailure(err, fallback) -> { status, error } for a failed helper call:
+//        400 for an address outside this server's pool, 404 for an unknown key, 503 when the pool is full
+function helperFailure(err, fallback) {
+    const msg = String((err && err.stderr) || '');
+    if (/invalid ip/.test(msg)) return { status: 400, error: 'ip is not a client address of this server' };
+    if (/no peer found/.test(msg)) return { status: 404, error: 'no such key' };
+    if (/IP pool exhausted/.test(msg)) return { status: 503, error: 'IP pool exhausted' };
+    return { status: 500, error: fallback };
 }
+
+// Usage: IPV4.test(str) -> shape check only; wg-api-helper decides whether the address belongs to the pool
+const IPV4 = /^(\d{1,3}\.){3}\d{1,3}$/;
 
 // Health endpoint is public (used by wg-healthcheck.sh)
 app.get('/health', (req, res) => {
@@ -1056,8 +1118,8 @@ app.post('/create', (req, res) => {
     try {
         const privateKey = execFileSync('wg', ['genkey'], { encoding: 'utf8' }).trim();
         const publicKey = execFileSync('wg', ['pubkey'], { input: privateKey, encoding: 'utf8' }).trim();
-        const clientIP = getNextIP();
-        helper(['add', publicKey, clientIP]);
+        const clientIP = helper(['add-auto', publicKey]).trim();   // helper picks the first free address under its lock
+        if (!IPV4.test(clientIP)) throw new Error('helper returned an unexpected address');
 
         const cfg =
             '[Interface]\n' +
@@ -1077,18 +1139,19 @@ app.post('/create', (req, res) => {
         res.type('text/plain').send(cfg);
     } catch (err) {
         console.error('create failed:', err.message);
-        res.status(500).json({ error: 'create failed' });
+        const f = helperFailure(err, 'create failed');
+        res.status(f.status).json({ error: f.error });
     }
 });
 
-// POST /remove  { "ipAddress": "10.66.66.5" }
+// POST /remove  { "ipAddress": "10.66.0.5" }
 app.post('/remove', (req, res) => {
     const ipAddress = req.body && req.body.ipAddress;
     if (typeof ipAddress !== 'string' || !ipAddress) {
         return res.status(400).json({ error: 'ipAddress required' });
     }
     const ipOnly = ipAddress.split('/')[0];
-    if (!/^10\.66\.66\.[1-9][0-9]{0,2}$/.test(ipOnly)) {
+    if (!IPV4.test(ipOnly)) {
         return res.status(400).json({ error: 'invalid ipAddress format' });
     }
     try {
@@ -1096,7 +1159,8 @@ app.post('/remove', (req, res) => {
         res.json({ success: true, removed: ipOnly });
     } catch (err) {
         console.error('remove failed:', err.message);
-        res.status(500).json({ error: 'remove failed' });
+        const f = helperFailure(err, 'remove failed');
+        res.status(f.status).json({ error: f.error });
     }
 });
 
@@ -1117,7 +1181,7 @@ function parseUsage(text) {
 }
 
 // GET /usage        -> { interface, timestamp, totals, keys: [ per-key usage ] }
-// GET /usage/:ip    -> usage of one key, e.g. /usage/10.66.66.5
+// GET /usage/:ip    -> usage of one key, e.g. /usage/10.66.0.5
 // Counters come from the kernel and reset when wg0 restarts or the server reboots.
 app.get('/usage', (req, res) => {
     try {
@@ -1130,13 +1194,14 @@ app.get('/usage', (req, res) => {
         res.json({ interface: 'wg0', timestamp: new Date().toISOString(), totals, keys });
     } catch (err) {
         console.error('usage failed:', err.message);
-        res.status(500).json({ error: 'usage failed' });
+        const f = helperFailure(err, 'usage failed');
+        res.status(f.status).json({ error: f.error });
     }
 });
 
 app.get('/usage/:ip', (req, res) => {
     const ip = req.params.ip.split('/')[0];
-    if (!/^10\.66\.66\.[1-9][0-9]{0,2}$/.test(ip)) {
+    if (!IPV4.test(ip)) {
         return res.status(400).json({ error: 'invalid ip' });
     }
     try {
@@ -1145,7 +1210,8 @@ app.get('/usage/:ip', (req, res) => {
         res.json(keys[0]);
     } catch (err) {
         console.error('usage failed:', err.message);
-        res.status(500).json({ error: 'usage failed' });
+        const f = helperFailure(err, 'usage failed');
+        res.status(f.status).json({ error: f.error });
     }
 });
 
@@ -1157,7 +1223,6 @@ SERVER_JS_EOF
         -e "s|__SERVER_PUB__|${SERVER_PUBLIC_KEY}|g" \
         -e "s|__ENDPOINT__|${DOMAIN}|g" \
         -e "s|__WG_PORT__|${WG_PORT}|g" \
-        -e "s|__NET_PREFIX__|${WG_NET_PREFIX}|g" \
         -e "s|__DNS__|${CLIENT_DNS}|g" \
         -e "s|__API_PORT__|${API_PORT_INTERNAL}|g" \
         "${API_DIR}/server.js"
@@ -1299,6 +1364,22 @@ step_write_access_config() {
     ok "Access config saved to ${ACCESS_FILE}"
 }
 
+# Usage: cidr_network 10.66.0.1/16 -> 10.66.0.0/16
+cidr_network() {
+    local ip="${1%/*}" p="${1#*/}" o a b c d mask n
+    IFS=. read -r a b c d <<<"$ip"
+    n=$(( (a<<24) + (b<<16) + (c<<8) + d ))
+    mask=$(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF ))
+    n=$(( n & mask ))
+    echo "$(( (n>>24)&255 )).$(( (n>>16)&255 )).$(( (n>>8)&255 )).$(( n&255 ))/$p"
+}
+
+# Usage: sample_ip -> the first client address of the pool (server address + 1), for the example commands
+sample_ip() {
+    local base="${WG_SERVER_ADDR%/*}"
+    echo "${base%.*}.$(( ${base##*.} + 1 ))"
+}
+
 # Usage: load_existing_settings -> reads domain, token, keys and ports from an existing install (for --reconfigure-api)
 load_existing_settings() {
     [ -f "${API_DIR}/server.js" ] || die "No existing install found (${API_DIR}/server.js is missing). Run a normal install first."
@@ -1309,7 +1390,9 @@ load_existing_settings() {
     API_TOKEN="$(sed -n 's/^API_TOKEN=//p' "${API_ENV_DIR}/env" 2>/dev/null | head -n1)"
     [ -n "$API_TOKEN" ] || die "Could not read the API token from ${API_ENV_DIR}/env."
     SERVER_PUBLIC_KEY="$(cat /etc/wireguard/server_public.key 2>/dev/null || true)"
-    local lp ip
+    local lp ip addr
+    addr="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*\([0-9.]*\/[0-9]*\).*/\1/p' "$WG_CONFIG" 2>/dev/null | head -n1)"
+    if [ -n "$addr" ]; then WG_SERVER_ADDR="$addr"; WG_NETWORK="$(cidr_network "$addr")"; fi
     lp="$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$WG_CONFIG" 2>/dev/null | head -n1)"
     if [ -n "$lp" ]; then WG_PORT="$lp"; fi
     ip="$(sed -n 's/^app\.listen(\([0-9]*\),.*/\1/p' "${API_DIR}/server.js" | head -n1)"
@@ -1451,16 +1534,27 @@ print_success_message() {
         echo "  Access config (Outline style, saved in ${ACCESS_FILE}):"
         echo "    $(jq -c . "$ACCESS_FILE" 2>/dev/null || true)"
         echo
+        local sep="  ----------------------------------------------------------------------"
+        echo "$sep"
         echo "  Create a client (add ?format=json for JSON):"
         echo "    curl ${tlsopts}-X POST ${API_URL}/create -H \"Authorization: Bearer ${API_TOKEN}\""
+        echo
+        echo "$sep"
         echo "  Remove a client:"
         echo "    curl ${tlsopts}-X POST ${API_URL}/remove -H \"Authorization: Bearer ${API_TOKEN}\" \\"
-        echo "      -H 'Content-Type: application/json' -d '{\"ipAddress\":\"10.66.66.2\"}'"
+        echo "      -H 'Content-Type: application/json' -d '{\"ipAddress\":\"$(sample_ip)\"}'"
+        echo
+        echo "$sep"
         echo "  List ALL keys with upload/download (bytes) and last handshake:"
         echo "    curl ${tlsopts}${API_URL}/usage -H \"Authorization: Bearer ${API_TOKEN}\""
+        echo
+        echo "$sep"
         echo "  Usage of ONE key (by its IP address):"
-        echo "    curl ${tlsopts}${API_URL}/usage/10.66.66.2 -H \"Authorization: Bearer ${API_TOKEN}\""
-        echo "  (upload/download are from the client's point of view; counters reset when wg0 or the server restarts)"
+        echo "    curl ${tlsopts}${API_URL}/usage/$(sample_ip) -H \"Authorization: Bearer ${API_TOKEN}\""
+        echo
+        echo "  (upload/download are from the client's point of view; counters reset when wg0 or the server restarts."
+        echo "   Polling: one /usage call per minute is fine; prefer it over one call per key.)"
+        echo "$sep"
         if [ -n "$tlsopts" ]; then
             echo "  (the certificate is self-made: --pinnedpubkey checks it against the fingerprint above"
             echo "   instead of a public CA; change port or certificate later with --reconfigure-api)"
@@ -1487,7 +1581,7 @@ END
     echo "    sudo wg-healthcheck.sh [--capture=20]     health check"
     echo "    sudo vpn-doctor.sh [--fix] [--dry-run]    diagnose and fix"
     echo "    journalctl -t wg-peer-ctrl -f             enforcement audit log"
-    [ -z "$MONITOR_KEY" ] && echo "    sudo $0 --add-monitor --monitor-key-file=FILE   add wg-monitor later"
+    [ -z "$MONITOR_KEY" ] && echo "    ${SELF_CMD} --add-monitor --monitor-key-file=FILE   add wg-monitor later (as root)"
     echo
     echo "  Keep the token secret; rotate it (edit ${API_ENV_DIR}/env with vi, then"
     echo "  systemctl restart ${API_SERVICE}) if it was ever pasted anywhere."
