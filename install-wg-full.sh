@@ -7,7 +7,7 @@
 #     (survive reboots) and ip_forward persisted in /etc/sysctl.d
 #   - wg-api  (Node.js, localhost only) behind Caddy on an HTTPS port YOU choose
 #     (the installer scans for free ports) with a Bearer token:
-#     POST /create, POST /remove, GET /health. Nothing listens on port 80.
+#     POST /create, POST /remove, GET /usage[/<ip>], GET /health. Nothing listens on port 80.
 #   - /usr/local/bin/wg-peer-ctrl.sh   restricted dispatcher (suspend, limits...)
 #   - /usr/local/bin/wg-healthcheck.sh health check  (from the repo)
 #   - /usr/local/bin/vpn-doctor.sh     diagnose + fix (from the repo)
