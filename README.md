@@ -35,9 +35,12 @@ During an interactive install you are asked for:
    HTTPS ports (443, 8443, 2053, 2083, 2087, 2096) are free and lets you pick one.
    Nothing ever listens on port 80.
 4. The **TLS mode** (see below).
-5. The management server's **`wg-monitor` public key**
-   (contents of `/root/.ssh/wg_monitor_key.pub` on US08, see [below](#1-generate-the-key-once-on-us08)).
-   Leave it blank to skip and add it later.
+
+The `wg-monitor` SSH account is **optional and not asked about**: the HTTPS API
+(including `GET /usage`) is all a manager such as Outline Manager or a polling script needs, using
+`/etc/wg-api/access.json`. Only if you also want SSH-based enforcement (suspend, speed limits)
+from a management server, add it with `--monitor-key-file=/root/wg_monitor_key.pub` at install
+time or `--add-monitor` later (see [below](#1-generate-the-key-once-on-us08)).
 
 At the end it prints **WIREGUARD SERVER INSTALLED** with the API URL, HTTPS port,
 Bearer token, certificate fingerprint and ready-to-copy commands. The same access
@@ -57,6 +60,7 @@ details are saved in `/etc/wg-api/access.json`:
 | `--tls=selfsigned\|letsencrypt` | `selfsigned` (default, pinned by fingerprint); `letsencrypt` only with `--https-port=443` |
 | `--tls-cert=FILE --tls-key=FILE` | use your own certificate (copied, does not follow renewals) |
 | `--api-port=N` | internal API port (default 4242, localhost only) |
+| `--network253` | use `10.66.66.0/24` (253 keys, the old `install-wg3.sh` pool) instead of the default `10.66.0.0/16` |
 | `--dns=IP[,IP]` | DNS handed to clients (default 1.1.1.1) |
 | `--monitor-key="ssh-..."` / `--monitor-key-file=FILE` | `wg-monitor` public key of the management server |
 | `--no-api` | WireGuard + tools only, no Caddy/Node/API |
@@ -86,12 +90,19 @@ All endpoints except `/health` need the header `Authorization: Bearer <apiToken>
 | Endpoint | Purpose |
 |---|---|
 | `POST /create` | create a key; returns the client config as text (`?format=json` for JSON) |
-| `POST /remove` | remove a key, body `{"ipAddress":"10.66.66.2"}` |
+| `POST /remove` | remove a key, body `{"ipAddress":"10.66.0.2"}` |
 | `GET /usage` | **all keys**: upload/download bytes, last handshake, plus totals |
-| `GET /usage/<ip>` | usage of **one key**, e.g. `/usage/10.66.66.2` |
+| `GET /usage/<ip>` | usage of **one key**, e.g. `/usage/10.66.0.2` |
 | `GET /health` | liveness check, no token needed |
 
-A key is identified by its IP address (`10.66.66.x`).
+Errors: `401` wrong or missing token, `400` malformed address or one that is not a client
+address of this server, `404` unknown key, `503` address pool full.
+
+A key is identified by its IP address. The default pool is `10.66.0.0/16`: the server is
+`10.66.0.1` and keys are handed out from `10.66.0.2` up to `10.66.255.254`, **65,533 keys** in total.
+With `--network253` the pool is `10.66.66.0/24` (`10.66.66.2` to `10.66.66.254`, **253 keys**).
+The pool size is fixed when the server is installed; it cannot be changed afterwards without
+reinstalling, because every client address and the server's own address would change.
 
 ```bash
 # self-signed certificate: pin the public key instead of trusting a CA
@@ -101,7 +112,7 @@ URL='https://vpn.example.com:2053'
 
 curl --insecure --pinnedpubkey "$PIN" -X POST "$URL/create" -H "Authorization: Bearer $TOKEN"
 curl --insecure --pinnedpubkey "$PIN" "$URL/usage"          -H "Authorization: Bearer $TOKEN"
-curl --insecure --pinnedpubkey "$PIN" "$URL/usage/10.66.66.2" -H "Authorization: Bearer $TOKEN"
+curl --insecure --pinnedpubkey "$PIN" "$URL/usage/10.66.0.2" -H "Authorization: Bearer $TOKEN"
 ```
 
 `GET /usage` response:
@@ -112,7 +123,7 @@ curl --insecure --pinnedpubkey "$PIN" "$URL/usage/10.66.66.2" -H "Authorization:
   "timestamp": "2026-10-16T09:13:41.825Z",
   "totals": { "uploadBytes": 1048576, "downloadBytes": 2097152, "totalBytes": 3145728 },
   "keys": [
-    { "ipAddress": "10.66.66.2", "uploadBytes": 1048576, "downloadBytes": 2097152,
+    { "ipAddress": "10.66.0.2", "uploadBytes": 1048576, "downloadBytes": 2097152,
       "totalBytes": 3145728, "lastHandshake": "2026-10-16T09:10:00.000Z" }
   ]
 }
@@ -279,10 +290,12 @@ over the same channel — is rejected with `ERROR: command not permitted`
 and logged as a `DENY`.
 
 **Speed-limit note:** `peer-setlimit` derives its `tc` class ID from the
-peer's last IP octet, which only works cleanly because every peer comes
-from one flat `10.66.66.0/24` pool (per this installer's `getNextIP()`). If
-a node ever hands out addresses from more than one subnet, this needs a
-proper class-ID allocator instead.
+peer's third and fourth IP octet (`third * 256 + fourth`, in hex, which is what `tc` expects).
+That is unique inside any single pool up to a `/16` (the default `10.66.0.0/16` as well as
+`--network253`), and `1:ffff` is the unlimited default class. If a node ever hands out
+addresses from more than one pool, this needs a proper class-ID allocator instead.
+Limits set by an older version of the script used the last octet only; re-apply them
+with `peer-setlimit` after upgrading.
 
 ---
 
@@ -331,13 +344,13 @@ on that node and retest.
 ### 3. Write verbs, against a throwaway peer
 
 ```bash
-ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP "peer-suspend 10.66.66.X/32"
+ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP "peer-suspend 10.66.0.X/32"
 # on the VPN node: iptables -L WG-SUSPEND -n
-ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP "peer-unsuspend 10.66.66.X/32"
+ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP "peer-unsuspend 10.66.0.X/32"
 
-ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP "peer-setlimit 10.66.66.X/32 2000"
+ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP "peer-setlimit 10.66.0.X/32 2000"
 # on the VPN node: tc class show dev wg0 ; tc class show dev ifb0
-ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP "peer-clearlimit 10.66.66.X/32"
+ssh -i /root/.ssh/wg_monitor_key wg-monitor@VPN_SERVER_IP "peer-clearlimit 10.66.0.X/32"
 ```
 
 Each should print `OK: ...`, and `journalctl -t wg-peer-ctrl -n 20` should
