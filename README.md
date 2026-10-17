@@ -17,7 +17,8 @@ Run it directly from GitHub (arguments go **after** the closing `)`):
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh)
-
+```
+```bash
 # non-interactive example
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh) \
     --domain=vpn.example.com --port=39022 --https-port=2053 --yes
