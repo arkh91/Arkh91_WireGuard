@@ -3,7 +3,7 @@
 # wg-healthcheck.sh - WireGuard health check & troubleshooting
 #
 # Built for the setup created by install-wg3.sh:
-#   interface wg0, subnet 10.66.66.0/24, iptables MASQUERADE, wg-api, caddy.
+#   interface wg0, subnet auto-detected (default pool 10.66.0.0/16), iptables MASQUERADE, wg-api, caddy.
 #
 # Symptom it targets: "handshake succeeds but no traffic passes".
 # A handshake only proves keys + UDP reachability. Everything after that
@@ -13,7 +13,7 @@
 #   sudo ./wg-healthcheck.sh                   # run all checks
 #   sudo ./wg-healthcheck.sh --capture=20      # also sniff wg0 for 20s
 #   sudo ./wg-healthcheck.sh --if=wg1          # different interface
-#   sudo ./wg-healthcheck.sh --net=10.8.0.0/24 # different VPN subnet
+#   sudo ./wg-healthcheck.sh --net=10.8.0.0/24 # force a VPN subnet (default: read from wg0.conf)
 #   sudo ./wg-healthcheck.sh --report=/tmp/wg.txt   # also save output
 #   sudo ./wg-healthcheck.sh --no-color
 #
@@ -25,7 +25,7 @@ set -u
 
 # ----------------------------- defaults --------------------------------------
 WG_IF="wg0"
-WG_NET="10.66.66.0/24"
+WG_NET=""            # empty = read it from the Address line of /etc/wireguard/<if>.conf (--net= overrides)
 API_PORT=4242
 API_DIR="/opt/wg-api"
 API_SERVICE="wg-api.service"
@@ -109,6 +109,21 @@ parse_args() {
         echo "--capture needs a number of seconds"; exit 2
     fi
     WG_CONF="/etc/wireguard/${WG_IF}.conf"
+    if [ -z "$WG_NET" ]; then WG_NET="$(detect_net)"; fi
+}
+
+# Usage: detect_net   -> prints the VPN network (e.g. 10.66.0.0/16 or 10.66.66.0/24) from the interface Address
+detect_net() {
+    local addr ip p a b c d n mask
+    addr=$(sed -n 's/^Address[[:space:]]*=[[:space:]]*\([0-9.]*\/[0-9]*\).*/\1/p' "$WG_CONF" 2>/dev/null | head -n1)
+    [ -n "$addr" ] || addr=$(ip -4 -o addr show dev "$WG_IF" 2>/dev/null | awk '{print $4; exit}')
+    if [ -z "$addr" ]; then echo "10.66.66.0/24"; return; fi
+    ip="${addr%/*}"; p="${addr#*/}"
+    IFS=. read -r a b c d <<<"$ip"
+    n=$(( (a<<24) + (b<<16) + (c<<8) + d ))
+    mask=$(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF ))
+    n=$(( n & mask ))
+    echo "$(( (n>>24)&255 )).$(( (n>>16)&255 )).$(( (n>>8)&255 )).$(( n&255 ))/$p"
 }
 
 # Usage: require_root   -> exits unless running as root
@@ -452,7 +467,7 @@ check_nat() {
 
     local nat; nat=$(iptables -t nat -S POSTROUTING 2>/dev/null | grep MASQUERADE)
     if [ -z "$nat" ]; then
-        fail "no MASQUERADE rule in nat/POSTROUTING -> clients leave with private 10.66.66.x source and never get replies"
+        fail "no MASQUERADE rule in nat/POSTROUTING -> clients leave with private VPN-network source and never get replies"
         add_fix "iptables -t nat -A POSTROUTING -s ${WG_NET} -o ${OUT_IFACE} -j MASQUERADE; netfilter-persistent save"
     else
         info "$(head -n3 <<<"$nat")"
