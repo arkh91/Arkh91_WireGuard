@@ -751,7 +751,7 @@ WG_PEER_CTRL_EOF
 # Usage: step_install_monitor -> wg-monitor account, sudoers entry and sshd Match block (needs MONITOR_KEY)
 step_install_monitor() {
     if [ -z "$MONITOR_KEY" ]; then
-        warn "No wg-monitor public key given: skipping the monitor account (add it later with --add-monitor)."
+        say "wg-monitor SSH account not requested (optional; the HTTPS API already provides keys and usage)."
         return 0
     fi
     say "Setting up the ${MONITOR_USER} account..."
@@ -1501,7 +1501,8 @@ install_all() {
     ask_domain
     ask_https_port
     ask_tls_mode
-    ask_monitor_key
+    # no wg-monitor question here: the HTTPS API (incl. GET /usage) is all a manager needs;
+    # the SSH account is opt-in via --monitor-key / --monitor-key-file or --add-monitor
     step_install_packages
     detect_outbound_interface
     step_install_caddy
