@@ -8,7 +8,8 @@
 #     (survive reboots) and ip_forward persisted in /etc/sysctl.d
 #   - wg-api  (Node.js, localhost only) behind Caddy on an HTTPS port YOU choose
 #     (the installer scans for free ports) with a Bearer token:
-#     POST /create, POST /remove, GET /usage[/<ip>], GET /health. Nothing listens on port 80.
+#     POST /create, POST /remove, GET /keys[/<ip>], GET /usage[/<ip>], GET /health.
+#     Nothing listens on port 80.
 #   - /usr/local/bin/wg-peer-ctrl.sh   restricted dispatcher (suspend, limits...)
 #   - /usr/local/bin/wg-healthcheck.sh health check  (from the repo)
 #   - /usr/local/bin/vpn-doctor.sh     diagnose + fix (from the repo)
@@ -92,6 +93,8 @@ TLS_DIR="/etc/caddy/wg-api-tls"
 TLS_FINGERPRINT=""
 TLS_PIN=""
 ACCESS_FILE="${API_ENV_DIR}/access.json"
+ACCESS_OUTLINE_FILE="${API_ENV_DIR}/access-outline.json"
+API_PATH=""
 # how to call this script again in printed hints: run through 'bash <(curl ...)' $0 is /dev/fd/NN
 case "$0" in
     /dev/fd/*|/proc/*) SELF_CMD="bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh)" ;;
@@ -829,6 +832,10 @@ step_install_api_helper() {
 # only thing the API user may run as root and it accepts only these commands:
 #   wg-api-helper used-ips              every client address already in wg0.conf
 #   wg-api-helper add-auto <pubkey>     pick the first free address, add the peer, print the address
+#                                       (the client's private key may be given on stdin; it is kept in
+#                                        /etc/wg-api/clients.db, root only, so GET /keys can show the config again)
+#   wg-api-helper keys [<ip>]           every peer: ip, pubkey, stored private key, created, rx, tx, handshake, name
+#   wg-api-helper rename <ip> <name>    give a key a display name (1-64 characters, no control characters)
 #   wg-api-helper add <pubkey> <ip>     add a peer to wg0.conf AND the live interface
 #   wg-api-helper remove <ip>           remove a peer from wg0.conf AND the live interface
 #   wg-api-helper usage [<ip>]          traffic counters: one line per peer 'ip<TAB>rx<TAB>tx<TAB>handshake'
@@ -836,6 +843,7 @@ set -euo pipefail
 
 WG_IF="wg0"
 WG_CONF="/etc/wireguard/${WG_IF}.conf"
+CLIENT_DB="/etc/wg-api/clients.db"   # ip<TAB>client pubkey<TAB>client private key or -<TAB>created epoch<TAB>name
 
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
@@ -947,6 +955,7 @@ cmd_remove() {
         END { flush() }
     ' "$WG_CONF" > "$WORK"
     install_conf "$WORK"
+    db_drop "$ip"
     logger -t wg-api-helper "result=OK action=remove ip=${ip}"
     echo "OK: peer removed ($ip)"
 }
@@ -963,13 +972,91 @@ cmd_usage() {
     ' || true
 }
 
-# Usage: cmd_add_auto <pubkey>  -> picks the first free address and adds the peer under the same lock; prints the address
+# Usage: db_drop <ip>           -> removes the stored client record of <ip> (if any)
+db_drop() {
+    [ -f "$CLIENT_DB" ] || return 0
+    awk -F'\t' -v ip="$1" '$1 != ip' "$CLIENT_DB" > "$TMPD/db.new"
+    install -o root -g root -m 600 "$TMPD/db.new" "$CLIENT_DB"
+}
+
+# Usage: db_put <ip> <pubkey> <privkey|-> [<created epoch>] [<name>]  -> stores the client record of <ip>
+#        (created defaults to now)
+db_put() {
+    db_drop "$1"
+    mkdir -p "$(dirname "$CLIENT_DB")"
+    ( umask 077; printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-$(date +%s)}" "${5:-}" >> "$CLIENT_DB" )
+    chmod 600 "$CLIENT_DB"
+}
+
+# Usage: valid_name <name>      -> 0 for 1-64 characters without tabs, newlines or other control characters
+valid_name() {
+    local n="$1"
+    [ -n "$n" ] && [ "${#n}" -le 64 ] && ! [[ "$n" =~ [[:cntrl:]] ]]
+}
+
+# Usage: cmd_rename <ip> <name> -> sets the display name of an existing key (keeps its stored private key)
+cmd_rename() {
+    local ip="$1" name="$2" pub rec
+    is_valid_ip "$ip" || fail "invalid ip"
+    valid_name "$name" || fail "invalid name"
+    pub="$(peer_key_for_ip "$ip")"
+    [ -n "$pub" ] || fail "no peer found with AllowedIPs ${ip}/32"
+    rec="$(awk -F'\t' -v ip="$ip" -v pub="$pub" '$1 == ip && $2 == pub { print $3 "\t" $4; exit }' "$CLIENT_DB" 2>/dev/null || true)"
+    if [ -n "$rec" ]; then
+        db_put "$ip" "$pub" "${rec%%$'\t'*}" "${rec#*$'\t'}" "$name"
+    else
+        db_put "$ip" "$pub" "-" "0" "$name"     # a key made by hand: no private key, creation time unknown
+    fi
+    logger -t wg-api-helper "result=OK action=rename ip=${ip}"
+    echo "OK: renamed ($ip)"
+}
+
+# Usage: echo "<privkey>" | cmd_add_auto <pubkey> [<name>]
+#                               -> picks the first free address and adds the peer under the same lock; prints the address.
+#                                  The optional private key on stdin must belong to <pubkey>; it is stored for GET /keys.
 cmd_add_auto() {
-    local pub="$1" ip
+    local pub="$1" name="${2:-}" ip priv=""
     is_valid_pubkey "$pub" || fail "invalid public key"
+    if [ -n "$name" ]; then valid_name "$name" || fail "invalid name"; fi
+    if [ ! -t 0 ]; then IFS= read -r priv || true; fi
+    if [ -n "$priv" ]; then
+        is_valid_pubkey "$priv" || fail "invalid private key"
+        [ "$(printf '%s' "$priv" | wg pubkey 2>/dev/null)" = "$pub" ] || fail "private key does not match the public key"
+    fi
     ip="$(next_free_ip)" || fail "IP pool exhausted"
     cmd_add "$pub" "$ip" >/dev/null
+    db_put "$ip" "$pub" "${priv:--}" "" "$name"
     echo "$ip"
+}
+
+# Usage: cmd_keys [<ip>]        -> one line per peer in wg0.conf:
+#        ip<TAB>client pubkey<TAB>private key or -<TAB>created epoch or 0<TAB>rx<TAB>tx<TAB>last handshake epoch<TAB>name
+#        (keys added by hand or before clients.db existed have no private key: '-')
+cmd_keys() {
+    local want="${1:-}"
+    if [ -n "$want" ]; then is_valid_ip "$want" || fail "invalid ip"; fi
+    { wg show "$WG_IF" dump 2>/dev/null || true; } > "$TMPD/dump"
+    if [ -f "$CLIENT_DB" ]; then cp "$CLIENT_DB" "$TMPD/db"; else : > "$TMPD/db"; fi
+    awk -v want="$want" '
+        function flush() {
+            if (pub != "" && ip != "" && (want == "" || ip == want)) {
+                mine = (ip in dbpriv && dbpub[ip] == pub)
+                p = mine ? dbpriv[ip] : "-"
+                c = mine ? dbtime[ip] : 0
+                nm = mine ? dbname[ip] : ""
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in rx ? rx[pub] : 0), (pub in tx ? tx[pub] : 0), (pub in hs ? hs[pub] : 0), nm
+            }
+            pub = ""; ip = ""
+        }
+        FILENAME == ARGV[1] { split($0, f, "\t"); dbpub[f[1]] = f[2]; dbpriv[f[1]] = f[3]; dbtime[f[1]] = f[4]; dbname[f[1]] = f[5]; next }
+        FILENAME == ARGV[2] { split($0, f, "\t"); if (FNR > 1) { hs[f[1]] = f[5]; rx[f[1]] = f[6]; tx[f[1]] = f[7] }; next }
+        /^\[/ { flush(); next }
+        /^PublicKey[ \t]*=/  { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); pub = v; next }
+        /^AllowedIPs[ \t]*=/ { v = $0; sub(/^AllowedIPs[ \t]*=[ \t]*/, "", v); n = split(v, a, /[ \t]*,[ \t]*/)
+                               for (i = 1; i <= n; i++) if (a[i] ~ /\/32$/) { sub(/\/32$/, "", a[i]); ip = a[i]; break }
+                               next }
+        END { flush() }
+    ' "$TMPD/db" "$TMPD/dump" "$WG_CONF"
 }
 
 exec 9>/run/wg-api-helper.lock
@@ -979,7 +1066,9 @@ load_network
 case "${1:-}" in
     used-ips) [ "$#" -eq 1 ] || fail "usage: used-ips";           cmd_used_ips ;;
     add)      [ "$#" -eq 3 ] || fail "usage: add <pubkey> <ip>";  cmd_add "$2" "$3" ;;
-    add-auto) [ "$#" -eq 2 ] || fail "usage: add-auto <pubkey>";  cmd_add_auto "$2" ;;
+    add-auto) [ "$#" -ge 2 ] && [ "$#" -le 3 ] || fail "usage: add-auto <pubkey> [<name>]"; cmd_add_auto "$2" "${3:-}" ;;
+    rename)   [ "$#" -eq 3 ] || fail "usage: rename <ip> <name>"; cmd_rename "$2" "$3" ;;
+    keys)     [ "$#" -le 2 ] || fail "usage: keys [<ip>]";        cmd_keys "${2:-}" ;;
     remove)   [ "$#" -eq 2 ] || fail "usage: remove <ip>";        cmd_remove "$2" ;;
     usage)    [ "$#" -le 2 ] || fail "usage: usage [<ip>]";       cmd_usage "${2:-}" ;;
     *)        fail "command not permitted: ${1:-<empty>}" ;;
@@ -1033,6 +1122,14 @@ step_generate_token() {
         ( umask 077; printf 'API_TOKEN=%s\n' "$API_TOKEN" > "${API_ENV_DIR}/env" )
         ok "Generated a new API token"
     fi
+    # the Outline-style secret path (https://host:port/<API_PATH>); added to older installs as well
+    API_PATH="$(sed -n 's/^API_PATH=//p' "${API_ENV_DIR}/env" | head -n1)"
+    if ! [[ "$API_PATH" =~ ^[A-Za-z0-9_-]{16,128}$ ]]; then
+        API_PATH="$(openssl rand -base64 18 | tr '+/' '-_' | tr -d '=\n')"
+        sed -i '/^API_PATH=/d' "${API_ENV_DIR}/env"
+        printf 'API_PATH=%s\n' "$API_PATH" >> "${API_ENV_DIR}/env"
+        ok "Generated the secret API path"
+    fi
     chmod 600 "${API_ENV_DIR}/env"
 }
 
@@ -1067,6 +1164,10 @@ if (API_TOKEN.length < 32) {
     console.error('API_TOKEN is missing or too short (see /etc/wg-api/env)');
     process.exit(1);
 }
+// Outline-style secret path: https://host:port/<API_PATH>/... needs no Authorization header (like Outline's apiUrl).
+// Empty = only the Bearer token is accepted.
+const API_PATH = /^[A-Za-z0-9_-]{16,128}$/.test(process.env.API_PATH || '') ? process.env.API_PATH : '';
+if (process.env.API_PATH && !API_PATH) console.error('API_PATH ignored: use 16-128 characters A-Z a-z 0-9 _ -');
 
 // NOTE: wg-healthcheck.sh and vpn-doctor.sh read the next line, keep its format
 const SERVER_PUB = '__SERVER_PUB__';
@@ -1075,6 +1176,12 @@ const WG_PORT = __WG_PORT__;
 const CLIENT_DNS = '__DNS__';
 const HELPER = '/usr/local/bin/wg-api-helper';
 
+// Usage: sameSecret(a, b) -> true if two strings are equal (constant time)
+function sameSecret(a, b) {
+    const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
 // Usage: tokenOk(headerValue) -> true if the Authorization header equals "Bearer <token>" (constant time)
 function tokenOk(header) {
     const expected = Buffer.from('Bearer ' + API_TOKEN);
@@ -1082,9 +1189,64 @@ function tokenOk(header) {
     return given.length === expected.length && crypto.timingSafeEqual(given, expected);
 }
 
-// Usage: helper(['add', pubkey, ip]) -> runs wg-api-helper as root through sudo, no shell involved
-function helper(args) {
-    return execFileSync('sudo', ['-n', HELPER, ...args], { encoding: 'utf8' });
+const CLIENT_ALLOWED_IPS = '0.0.0.0/0';
+const CLIENT_KEEPALIVE = 25;
+
+// Usage: helper(['add', pubkey, ip], stdinText?) -> runs wg-api-helper as root through sudo, no shell involved
+//        (secrets such as a private key go through stdin, never on the command line)
+function helper(args, input) {
+    return execFileSync('sudo', ['-n', HELPER, ...args], { encoding: 'utf8', input: input || '' });
+}
+
+// Usage: buildConfig(privateKey, ip) -> the client's wg-quick config text
+function buildConfig(privateKey, ip) {
+    return '[Interface]\n' +
+        'PrivateKey = ' + privateKey + '\n' +
+        'Address = ' + ip + '/32\n' +
+        'DNS = ' + CLIENT_DNS + '\n' +
+        '\n' +
+        '[Peer]\n' +
+        'PublicKey = ' + SERVER_PUB + '\n' +
+        'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\n' +
+        'AllowedIPs = ' + CLIENT_ALLOWED_IPS + '\n' +
+        'PersistentKeepalive = ' + CLIENT_KEEPALIVE + '\n';
+}
+
+// Usage: keyObject({ip, publicKey, privateKey, created, rx, tx, hs}) -> one key as returned by /keys and /create?format=json
+//        privateKey/config are null for keys whose private key the server never saw (added by hand or by an older version)
+function keyObject(k) {
+    const up = k.rx || 0, down = k.tx || 0;
+    return {
+        id: k.ip,
+        name: k.name || '',
+        ipAddress: k.ip,
+        address: k.ip + '/32',
+        privateKey: k.privateKey || null,
+        publicKey: k.publicKey,
+        dns: CLIENT_DNS,
+        serverPublicKey: SERVER_PUB,
+        endpoint: ENDPOINT + ':' + WG_PORT,
+        allowedIPs: CLIENT_ALLOWED_IPS,
+        persistentKeepalive: CLIENT_KEEPALIVE,
+        createdAt: k.created ? new Date(k.created * 1000).toISOString() : null,
+        uploadBytes: up,
+        downloadBytes: down,
+        totalBytes: up + down,
+        lastHandshake: k.hs ? new Date(k.hs * 1000).toISOString() : null,
+        config: k.privateKey ? buildConfig(k.privateKey, k.ip) : null
+    };
+}
+
+// Usage: parseKeys(helperOutput) -> [keyObject...] from 'wg-api-helper keys' (7 tab-separated fields per line)
+function parseKeys(text) {
+    return text.split('\n').filter(Boolean).map(line => {
+        const f = line.split('\t');
+        return keyObject({
+            ip: f[0], publicKey: f[1], privateKey: f[2] === '-' ? null : f[2],
+            created: parseInt(f[3], 10) || 0, rx: parseInt(f[4], 10) || 0,
+            tx: parseInt(f[5], 10) || 0, hs: parseInt(f[6], 10) || 0, name: f[7] || ''
+        });
+    });
 }
 
 // Usage: helperFailure(err, fallback) -> { status, error } for a failed helper call:
@@ -1092,9 +1254,17 @@ function helper(args) {
 function helperFailure(err, fallback) {
     const msg = String((err && err.stderr) || '');
     if (/invalid ip/.test(msg)) return { status: 400, error: 'ip is not a client address of this server' };
+    if (/invalid name/.test(msg)) return { status: 400, error: 'name must be 1-64 characters without control characters' };
     if (/no peer found/.test(msg)) return { status: 404, error: 'no such key' };
     if (/IP pool exhausted/.test(msg)) return { status: 503, error: 'IP pool exhausted' };
     return { status: 500, error: fallback };
+}
+
+// Usage: cleanName(value) -> a display name (trimmed, at most 64 characters, no control characters) or ''
+function cleanName(value) {
+    if (typeof value !== 'string') return '';
+    // eslint-disable-next-line no-control-regex
+    return value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 64);
 }
 
 // Usage: IPV4.test(str) -> shape check only; wg-api-helper decides whether the address belongs to the pool
@@ -1105,7 +1275,16 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Usage: app.use(auth) -> lets a request through when its first path segment is the secret API_PATH (the segment is
+//        then removed, so /<secret>/keys is served as /keys) or when it carries "Authorization: Bearer <token>"
 app.use((req, res, next) => {
+    if (API_PATH) {
+        const m = /^\/([^/?]+)(.*)$/.exec(req.url);
+        if (m && sameSecret(m[1], API_PATH)) {
+            req.url = m[2] && m[2][0] === '/' ? m[2] : '/' + (m[2] || '');
+            return next();
+        }
+    }
     if (!tokenOk(req.headers.authorization)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
@@ -1118,25 +1297,16 @@ app.post('/create', (req, res) => {
     try {
         const privateKey = execFileSync('wg', ['genkey'], { encoding: 'utf8' }).trim();
         const publicKey = execFileSync('wg', ['pubkey'], { input: privateKey, encoding: 'utf8' }).trim();
-        const clientIP = helper(['add-auto', publicKey]).trim();   // helper picks the first free address under its lock
+        // optional display name: JSON body {"name": "..."} or ?name=...
+        const name = cleanName((req.body && req.body.name) || req.query.name);
+        // the helper picks the first free address under its lock and keeps the private key for GET /keys
+        const clientIP = helper(name ? ['add-auto', publicKey, name] : ['add-auto', publicKey], privateKey + '\n').trim();
         if (!IPV4.test(clientIP)) throw new Error('helper returned an unexpected address');
 
-        const cfg =
-            '[Interface]\n' +
-            'PrivateKey = ' + privateKey + '\n' +
-            'Address = ' + clientIP + '/32\n' +
-            'DNS = ' + CLIENT_DNS + '\n' +
-            '\n' +
-            '[Peer]\n' +
-            'PublicKey = ' + SERVER_PUB + '\n' +
-            'Endpoint = ' + ENDPOINT + ':' + WG_PORT + '\n' +
-            'AllowedIPs = 0.0.0.0/0\n' +
-            'PersistentKeepalive = 25\n';
-
         if (req.query.format === 'json') {
-            return res.json({ address: clientIP + '/32', publicKey, privateKey, config: cfg });
+            return res.json(keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000) }));
         }
-        res.type('text/plain').send(cfg);
+        res.type('text/plain').send(buildConfig(privateKey, clientIP));
     } catch (err) {
         console.error('create failed:', err.message);
         const f = helperFailure(err, 'create failed');
@@ -1211,6 +1381,67 @@ app.get('/usage/:ip', (req, res) => {
     } catch (err) {
         console.error('usage failed:', err.message);
         const f = helperFailure(err, 'usage failed');
+        res.status(f.status).json({ error: f.error });
+    }
+});
+
+// GET /keys       -> every key on the server with its full client settings and usage (like Outline's access keys):
+//                    { server, count, totals, keys: [ keyObject ] }
+//                    Also answered at the apiUrl itself (GET /) and at /access-keys (Outline's path), so a
+//                    manager holding only the access config {apiUrl, apiToken, certSha256} gets every key
+//                    with one GET of apiUrl.
+// GET /keys/:ip   -> one key, e.g. /keys/10.66.0.5
+app.get(['/', '/keys', '/access-keys'], (req, res) => {
+    try {
+        const keys = parseKeys(helper(['keys']));
+        const totals = keys.reduce((t, k) => ({
+            uploadBytes: t.uploadBytes + k.uploadBytes,
+            downloadBytes: t.downloadBytes + k.downloadBytes,
+            totalBytes: t.totalBytes + k.totalBytes
+        }), { uploadBytes: 0, downloadBytes: 0, totalBytes: 0 });
+        res.json({
+            server: { publicKey: SERVER_PUB, endpoint: ENDPOINT + ':' + WG_PORT, dns: CLIENT_DNS },
+            timestamp: new Date().toISOString(),
+            count: keys.length,
+            totals,
+            keys
+        });
+    } catch (err) {
+        console.error('keys failed:', err.message);
+        const f = helperFailure(err, 'keys failed');
+        res.status(f.status).json({ error: f.error });
+    }
+});
+
+app.get(['/keys/:ip', '/access-keys/:ip'], (req, res) => {
+    const ip = req.params.ip.split('/')[0];
+    if (!IPV4.test(ip)) {
+        return res.status(400).json({ error: 'invalid ip' });
+    }
+    try {
+        const keys = parseKeys(helper(['keys', ip]));
+        if (keys.length === 0) return res.status(404).json({ error: 'no such key' });
+        res.json(keys[0]);
+    } catch (err) {
+        console.error('keys failed:', err.message);
+        const f = helperFailure(err, 'keys failed');
+        res.status(f.status).json({ error: f.error });
+    }
+});
+
+// PUT /keys/:ip/name  {"name": "Phone of Ali"}  -> renames a key; returns the key
+app.put(['/keys/:ip/name', '/access-keys/:ip/name'], (req, res) => {
+    const ip = req.params.ip.split('/')[0];
+    const name = cleanName(req.body && req.body.name);
+    if (!IPV4.test(ip)) return res.status(400).json({ error: 'invalid ip' });
+    if (!name) return res.status(400).json({ error: 'name required' });
+    try {
+        helper(['rename', ip, name]);
+        const keys = parseKeys(helper(['keys', ip]));
+        res.json(keys[0] || { ipAddress: ip, name });
+    } catch (err) {
+        console.error('rename failed:', err.message);
+        const f = helperFailure(err, 'rename failed');
         res.status(f.status).json({ error: f.error });
     }
 });
@@ -1315,6 +1546,11 @@ ${DOMAIN} {
     reverse_proxy 127.0.0.1:${API_PORT_INTERNAL}
     log {
         output file /var/log/caddy/wg-api.log
+        # never write the secret API path or the token to the log
+        format filter {
+            request>uri delete
+            request>headers>Authorization delete
+        }
     }
 }
 END
@@ -1331,6 +1567,11 @@ https://${DOMAIN}:${HTTPS_PORT} {
     reverse_proxy 127.0.0.1:${API_PORT_INTERNAL}
     log {
         output file /var/log/caddy/wg-api.log
+        # never write the secret API path or the token to the log
+        format filter {
+            request>uri delete
+            request>headers>Authorization delete
+        }
     }
 }
 END
@@ -1352,7 +1593,10 @@ END
     ok "Caddy proxies ${API_URL} to 127.0.0.1:${API_PORT_INTERNAL}"
 }
 
-# Usage: step_write_access_config -> saves the Outline-style {apiUrl, apiToken, certSha256} to /etc/wg-api/access.json (mode 600)
+# Usage: step_write_access_config -> saves both access configs (mode 600), either one opens the server in
+#        Mithra WireGuard Manager:
+#          /etc/wg-api/access.json          {apiUrl, apiToken, certSha256}
+#          /etc/wg-api/access-outline.json  {apiUrl: <url>/<secret path>, certSha256}   (exactly Outline's format)
 step_write_access_config() {
     [ "$INSTALL_API" -eq 1 ] || return 0
     compute_api_url
@@ -1360,8 +1604,13 @@ step_write_access_config() {
     install -d -o root -g root -m 700 "$API_ENV_DIR"
     ( umask 077; jq -n --arg u "$API_URL" --arg t "$API_TOKEN" --arg f "$TLS_FINGERPRINT" \
         '{apiUrl: $u, apiToken: $t, certSha256: (if $f == "" then null else $f end)}' > "$ACCESS_FILE" )
+    if [ -n "${API_PATH:-}" ]; then
+        ( umask 077; jq -n --arg u "${API_URL}/${API_PATH}" --arg f "$TLS_FINGERPRINT" \
+            '{apiUrl: $u, certSha256: (if $f == "" then null else $f end)}' > "$ACCESS_OUTLINE_FILE" )
+        chmod 600 "$ACCESS_OUTLINE_FILE"
+    fi
     chmod 600 "$ACCESS_FILE"
-    ok "Access config saved to ${ACCESS_FILE}"
+    ok "Access configs saved to ${ACCESS_FILE} and ${ACCESS_OUTLINE_FILE}"
 }
 
 # Usage: cidr_network 10.66.0.1/16 -> 10.66.0.0/16
@@ -1389,6 +1638,7 @@ load_existing_settings() {
     [ -n "$DOMAIN" ] || die "Could not read the domain from ${API_DIR}/server.js; pass --domain=NAME."
     API_TOKEN="$(sed -n 's/^API_TOKEN=//p' "${API_ENV_DIR}/env" 2>/dev/null | head -n1)"
     [ -n "$API_TOKEN" ] || die "Could not read the API token from ${API_ENV_DIR}/env."
+    API_PATH="$(sed -n 's/^API_PATH=//p' "${API_ENV_DIR}/env" 2>/dev/null | head -n1)"
     SERVER_PUBLIC_KEY="$(cat /etc/wireguard/server_public.key 2>/dev/null || true)"
     local lp ip addr
     addr="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*\([0-9.]*\/[0-9]*\).*/\1/p' "$WG_CONFIG" 2>/dev/null | head -n1)"
@@ -1406,12 +1656,51 @@ update_api() {
     local d
     d="$(sed -n "s/^const CLIENT_DNS = '\(.*\)';/\1/p" "${API_DIR}/server.js" | head -n1)"
     if [ -n "$d" ]; then CLIENT_DNS="$d"; fi
+    step_generate_token
     step_install_api_helper
     step_write_server_js
     systemctl restart wg-api || die "wg-api failed to restart: journalctl -u wg-api -n 30"
     sleep 1
     systemctl is-active --quiet wg-api || die "wg-api is not running: journalctl -u wg-api -n 30"
-    ok "wg-api updated (GET /usage and /usage/<ip> available)"
+    caddy_add_log_filter
+    # keep the existing URL and certificate fingerprint, add the Outline-style config next to them
+    if [ -f "$ACCESS_FILE" ]; then
+        API_URL="$(jq -r '.apiUrl // empty' "$ACCESS_FILE")"
+        TLS_FINGERPRINT="$(jq -r '.certSha256 // empty' "$ACCESS_FILE")"
+        API_URL="${API_URL%/}"
+        if [ -n "$API_URL" ]; then
+            ( umask 077; jq -n --arg u "${API_URL}/${API_PATH}" --arg f "$TLS_FINGERPRINT" \
+                '{apiUrl: $u, certSha256: (if $f == "" then null else $f end)}' > "$ACCESS_OUTLINE_FILE" )
+            chmod 600 "$ACCESS_OUTLINE_FILE"
+        fi
+    fi
+    ok "wg-api updated: GET /keys, key names, /usage and the Outline-style secret URL are available"
+    echo
+    echo "  Access config, paste either one into Mithra WireGuard Manager:"
+    [ -f "$ACCESS_FILE" ] && echo "    $(jq -c . "$ACCESS_FILE")"
+    [ -f "$ACCESS_OUTLINE_FILE" ] && echo "    $(jq -c . "$ACCESS_OUTLINE_FILE")"
+}
+
+# Usage: caddy_add_log_filter -> adds the filter that keeps the secret API path and the token out of Caddy's log to a
+#                                Caddyfile written by an older version of this script, then reloads Caddy
+caddy_add_log_filter() {
+    local cf=/etc/caddy/Caddyfile
+    [ -f "$cf" ] && grep -q 'install-wg-full.sh' "$cf" || return 0
+    grep -q 'request>uri delete' "$cf" && return 0
+    cp -a "$cf" "${cf}.bak-$(date +%Y%m%d-%H%M%S)"
+    sed -i '/output file \/var\/log\/caddy\/wg-api.log/a\
+        format filter {\
+            request>uri delete\
+            request>headers>Authorization delete\
+        }' "$cf"
+    if caddy validate --config "$cf" >/dev/null 2>&1; then
+        chown -R caddy:caddy /var/log/caddy 2>/dev/null || true
+        systemctl reload caddy 2>/dev/null || systemctl restart caddy || true
+        ok "Caddy log no longer records request paths or tokens"
+    else
+        warn "Could not add the log filter to ${cf} automatically; the original is kept in ${cf}.bak-*"
+        cp -a "$(ls -t "${cf}".bak-* | head -n1)" "$cf"
+    fi
 }
 
 # Usage: reconfigure_api -> new HTTPS port / certificate for an existing install; WireGuard keys and peers are not touched
@@ -1531,8 +1820,11 @@ print_success_message() {
         fi
         echo "  Bearer token:    ${API_TOKEN}   (stored in ${API_ENV_DIR}/env)"
         echo
-        echo "  Access config (Outline style, saved in ${ACCESS_FILE}):"
+        echo "  Access config: paste EITHER line into Mithra WireGuard Manager (Add server)."
+        echo "  Both open every key on this server. Treat them like passwords."
         echo "    $(jq -c . "$ACCESS_FILE" 2>/dev/null || true)"
+        [ -f "$ACCESS_OUTLINE_FILE" ] && echo "    $(jq -c . "$ACCESS_OUTLINE_FILE" 2>/dev/null || true)   (Outline format)"
+        echo "  (saved in ${ACCESS_FILE} and ${ACCESS_OUTLINE_FILE})"
         echo
         local sep="  ----------------------------------------------------------------------"
         echo "$sep"
@@ -1545,7 +1837,16 @@ print_success_message() {
         echo "      -H 'Content-Type: application/json' -d '{\"ipAddress\":\"$(sample_ip)\"}'"
         echo
         echo "$sep"
-        echo "  List ALL keys with upload/download (bytes) and last handshake:"
+        echo "  List ALL keys with their full settings (PrivateKey, DNS, PublicKey, Endpoint, AllowedIPs,"
+        echo "  PersistentKeepalive, ready-made config) and usage, like Outline Manager:"
+        echo "    curl ${tlsopts}${API_URL}/keys -H \"Authorization: Bearer ${API_TOKEN}\"   (also: ${API_URL}/ and /access-keys)"
+        echo
+        echo "$sep"
+        echo "  Or, from any machine, with ONLY the access config above (like Outline Manager):"
+        echo "    ./wg-pull-keys.sh '$(jq -c . "$ACCESS_FILE" 2>/dev/null || echo '<access config>')' --table"
+        echo
+        echo "$sep"
+        echo "  List ALL keys with upload/download (bytes) and last handshake (light, for polling):"
         echo "    curl ${tlsopts}${API_URL}/usage -H \"Authorization: Bearer ${API_TOKEN}\""
         echo
         echo "$sep"
