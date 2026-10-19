@@ -105,7 +105,7 @@ MONITOR_KEY_FILE=""
 MONITOR_MARK="# wg-monitor (install-wg-full.sh)"
 
 BIN_DIR="/usr/local/bin"
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 # the health tools are fetched from this exact commit and must match these hashes (update both together)
 REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/1764dec2a35b2f054217496e9e3ea929ebb59fe0"
 declare -A TOOL_SHA256=(
@@ -1194,6 +1194,7 @@ WG_IF="wg0"
 WG_CONF="/etc/wireguard/${WG_IF}.conf"
 CLIENT_DB="/etc/wg-api/clients.db"   # ip<TAB>client pubkey<TAB>client private key or -<TAB>created epoch<TAB>name
 TRAFFIC_DB="/var/lib/wg-api/traffic.db"   # pubkey<TAB>saved rx<TAB>saved tx<TAB>last live rx<TAB>last live tx<TAB>generation<TAB>last handshake
+                                          # <TAB>first connection (every key; the row goes when the key is removed)
 POLICY_DB="/etc/wg-api/policy.db"   # ip<TAB>pubkey<TAB>paused 0/1<TAB>limit bytes (0 = unlimited)<TAB>over the limit 0/1
                                     # <TAB>ends at (epoch, 0 = no end yet)<TAB>duration after first connection (e.g. 30d, 1m)
                                     # <TAB>first connection (epoch, 0 = not yet)<TAB>expired 0/1
@@ -1326,31 +1327,35 @@ traffic_gen() {
 }
 
 # Usage: traffic_merge totals|save  -> reads $TMPD/dump (wg show dump), traffic.db and wg0.conf
-#        totals: 'pubkey<TAB>total rx<TAB>total tx' for every key in wg0.conf that has traffic
+#        totals: 'pubkey<TAB>total rx<TAB>total tx<TAB>last handshake<TAB>first connection' for every key in wg0.conf
+#                that has traffic or has connected
 #        save:   the new traffic.db rows (keys no longer in wg0.conf are dropped)
 #        A key's saved part grows by its last live value when the counters were reset since the last save
 #        (new generation, or a counter smaller than before).
 traffic_merge() {
     if [ -f "$TRAFFIC_DB" ]; then cp "$TRAFFIC_DB" "$TMPD/traffic"; else : > "$TMPD/traffic"; fi
     awk -F'\t' -v mode="$1" -v gen="$(traffic_gen)" '
-        FILENAME == ARGV[1] { if (NF >= 6) { brx[$1] = $2; btx[$1] = $3; lrx[$1] = $4; ltx[$1] = $5; g[$1] = $6; shs[$1] = (NF >= 7 ? $7 : 0) }; next }
+        FILENAME == ARGV[1] { if (NF >= 6) { brx[$1] = $2; btx[$1] = $3; lrx[$1] = $4; ltx[$1] = $5; g[$1] = $6
+                                             shs[$1] = (NF >= 7 ? $7 : 0); sfirst[$1] = (NF >= 8 ? $8 : 0) }; next }
         FILENAME == ARGV[2] { if (FNR > 1) { live[$1] = 1; crx[$1] = $6; ctx[$1] = $7; chs[$1] = $5 }; next }
         /^PublicKey[ \t]*=/ { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); conf[v] = 1; next }
         END {
             for (p in conf) {
                 # the last handshake is kept too, so "last seen" survives a restart (live value when there is one)
                 h = (p in chs && chs[p] + 0 > 0) ? chs[p] : ((p in shs) ? shs[p] + 0 : 0)
+                # first connection: kept once seen; otherwise the first handshake noticed (checked every minute)
+                f = (p in sfirst && sfirst[p] + 0 > 0) ? sfirst[p] + 0 : h + 0
                 if (p in live) {
                     b_rx = (p in brx) ? brx[p] + 0 : 0; b_tx = (p in btx) ? btx[p] + 0 : 0
                     if ((p in g) && (g[p] != gen || crx[p] + 0 < lrx[p] + 0 || ctx[p] + 0 < ltx[p] + 0)) {
                         b_rx += lrx[p]; b_tx += ltx[p]
                     }
-                    if (mode == "save") printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\t%.0f\n", p, b_rx, b_tx, crx[p], ctx[p], gen, h
-                    else printf "%s\t%.0f\t%.0f\t%.0f\n", p, b_rx + crx[p], b_tx + ctx[p], h
+                    if (mode == "save") printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\t%.0f\t%.0f\n", p, b_rx, b_tx, crx[p], ctx[p], gen, h, f
+                    else printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\n", p, b_rx + crx[p], b_tx + ctx[p], h, f
                 } else if (p in brx) {
                     # wg0 is down (or the peer is not loaded): keep what was saved
-                    if (mode == "save") printf "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\n", p, brx[p], btx[p], lrx[p], ltx[p], g[p], h
-                    else printf "%s\t%.0f\t%.0f\t%.0f\n", p, brx[p] + lrx[p], btx[p] + ltx[p], h
+                    if (mode == "save") printf "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\t%.0f\n", p, brx[p], btx[p], lrx[p], ltx[p], g[p], h, f
+                    else printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\n", p, brx[p] + lrx[p], btx[p] + ltx[p], h, f
                 }
             }
         }' "$TMPD/traffic" "$TMPD/dump" "$WG_CONF"
@@ -1363,7 +1368,29 @@ cmd_traffic_save() {
     traffic_merge save > "$TMPD/traffic.new"
     install -o root -g root -m 600 "$TMPD/traffic.new" "${TRAFFIC_DB}.new"
     mv -f "${TRAFFIC_DB}.new" "$TRAFFIC_DB"
+    db_prune
     enforce_limits
+}
+
+# Usage: db_prune               -> drops clients.db rows (stored private key, name, created) of keys that are no longer in
+#                                  wg0.conf, e.g. removed by hand; traffic.db and policy.db prune themselves the same way
+db_prune() {
+    [ -s "$CLIENT_DB" ] || return 0
+    awk -F'\t' '
+        FILENAME == ARGV[1] {
+            if ($0 ~ /^\[/) pub = ""
+            if ($0 ~ /^PublicKey[ \t]*=/) { pub = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", pub); sub(/[ \t]+$/, "", pub) }
+            if ($0 ~ /^AllowedIPs[ \t]*=/ && pub != "") { v = $0; sub(/^AllowedIPs[ \t]*=[ \t]*/, "", v)
+                n = split(v, a, /[ \t]*,[ \t]*/); for (i = 1; i <= n; i++) if (a[i] ~ /\/32$/) { sub(/\/32$/, "", a[i]); owner[a[i]] = pub } }
+            next
+        }
+        ($1 in owner) && owner[$1] == $2
+        END { for (k in owner) n++; if (!n) exit 3 }
+    ' "$WG_CONF" "$CLIENT_DB" > "$TMPD/db.pruned" || return 0      # no peers parsed: never wipe on a bad read
+    if ! cmp -s "$TMPD/db.pruned" "$CLIENT_DB"; then
+        install -o root -g root -m 600 "$TMPD/db.pruned" "$CLIENT_DB"
+        logger -t wg-api-helper "result=OK action=prune-clients-db"
+    fi
 }
 
 # Usage: load_dump              -> writes the live 'wg show dump' to $TMPD/dump (empty when wg0 is down)
@@ -1373,12 +1400,17 @@ load_dump() { { wg show "$WG_IF" dump 2>/dev/null || true; } > "$TMPD/dump"; }
 #                                  and rows with nothing set)
 pol_write() {
     install -d -o root -g root -m 700 "$(dirname "$POLICY_DB")"
+    pol_clean "$1" "$TMPD/policy.clean"
+    install -o root -g root -m 600 "$TMPD/policy.clean" "${POLICY_DB}.new"
+    mv -f "${POLICY_DB}.new" "$POLICY_DB"
+}
+
+# Usage: pol_clean <in> <out>   -> copies the rows of keys still in wg0.conf that have something set
+pol_clean() {
     awk -F'\t' '
         FILENAME == ARGV[1] { if ($0 ~ /^PublicKey[ \t]*=/) { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); conf[v] = 1 }; next }
         ($2 in conf) && ($3 == "1" || $4 + 0 > 0 || $6 + 0 > 0 || $7 != "")
-    ' "$WG_CONF" "$1" > "$TMPD/policy.clean"
-    install -o root -g root -m 600 "$TMPD/policy.clean" "${POLICY_DB}.new"
-    mv -f "${POLICY_DB}.new" "$POLICY_DB"
+    ' "$WG_CONF" "$1" > "$2"
 }
 
 # Usage: fw_sync                -> applies policy.db to the firewall (WG-SUSPEND), if wg-firewall.sh is installed
@@ -1426,16 +1458,16 @@ pol_calc() {
     local now line ip pub pa li ov ex du first ed
     now="$(date +%s)"
     awk -F'\t' -v OFS='\t' -v now="$now" '
-        FILENAME == ARGV[1] { tot[$1] = $2 + $3; hs[$1] = $4 + 0; next }
+        FILENAME == ARGV[1] { tot[$1] = $2 + $3; first[$1] = $5 + 0; next }
         {
             ex = $6 + 0; du = $7; fi = $8 + 0
             over = ($4 + 0 > 0 && (tot[$2] + 0) >= $4 + 0) ? 1 : 0
-            if (du != "" && fi == 0 && hs[$2] > 0) { fi = hs[$2]; ex = "ADD" }
+            if (du != "" && fi == 0 && first[$2] > 0) { fi = first[$2]; ex = "ADD" }
             expd = (ex != "ADD" && ex > 0 && now + 0 >= ex) ? 1 : 0
             print $1, $2, $3 + 0, $4 + 0, over, ex, du, fi, expd
         }' "$TMPD/totals" "$1" > "$2.tmp"
     if grep -q $'\tADD\t' "$2.tmp"; then
-        # a key just made its first connection: its end is first connection + duration (months need date(1))
+        # a key with a recorded first connection: its end is first connection + duration (months need date(1))
         : > "$2"
         while IFS= read -r line; do
             IFS=$'\t' read -r ip pub pa li ov ex du first ed <<<"$line"
@@ -1456,9 +1488,9 @@ pol_calc() {
 
 # Usage: pol_set <ip> <pubkey> <paused|-> <limit|-> [<expiry|->]  -> changes one key's policy ('-' keeps the current
 #        value), recomputes it (pol_calc) and applies the firewall. <expiry>: see valid_expiry; "in:<d>" is turned into
-#        "at:<now + d>", "after:<d>" waits for the key's first connection (a key that has connected before starts now)
+#        "at:<now + d>", "after:<d>" counts from the key's first connection (waits for it when there is none yet)
 pol_set() {
-    local ip="$1" pub="$2" paused="$3" limit="$4" exp="${5:--}" ex="-" du="-" first=0 now hs
+    local ip="$1" pub="$2" paused="$3" limit="$4" exp="${5:--}" ex="-" du="-" first=0 now
     now="$(date +%s)"
     [ -f "$POLICY_DB" ] && cp "$POLICY_DB" "$TMPD/policy" || : > "$TMPD/policy"
     load_dump
@@ -1468,11 +1500,7 @@ pol_set() {
         0) ex=0; du="" ;;
         at:*) ex="${exp#at:}"; du="" ;;
         in:*) ex="$(add_duration "$now" "${exp#in:}")"; du="" ;;
-        after:*)
-            du="${exp#after:}"; ex=0
-            # a key that has connected before starts counting now (not at an old handshake)
-            hs="$(awk -F'\t' -v p="$pub" '$1 == p { print $4 + 0; exit }' "$TMPD/totals")"
-            if [ "${hs:-0}" -gt 0 ]; then first="$now"; ex="$(add_duration "$now" "$du")"; fi ;;
+        after:*) du="${exp#after:}"; ex=0 ;;      # pol_calc counts from the key's recorded first connection
     esac
     awk -F'\t' -v OFS='\t' -v ip="$ip" -v pub="$pub" -v paused="$paused" -v limit="$limit" -v ex="$ex" -v du="$du" \
         -v first="$first" '
@@ -1494,7 +1522,8 @@ pol_set() {
 enforce_limits() {
     [ -s "$POLICY_DB" ] || return 0
     traffic_merge totals > "$TMPD/totals"
-    pol_calc "$POLICY_DB" "$TMPD/policy.new"
+    pol_calc "$POLICY_DB" "$TMPD/policy.calc"
+    pol_clean "$TMPD/policy.calc" "$TMPD/policy.new"     # also drops keys removed from wg0.conf by hand
     if ! cmp -s "$TMPD/policy.new" "$POLICY_DB"; then
         pol_write "$TMPD/policy.new"
         fw_sync
@@ -1630,7 +1659,8 @@ cmd_add_auto() {
 # Usage: cmd_keys [<ip>]        -> one line per peer in wg0.conf:
 #        ip<TAB>client pubkey<TAB>private key or -<TAB>created epoch or 0<TAB>rx<TAB>tx<TAB>last handshake epoch<TAB>name
 #        <TAB>paused 0/1<TAB>limit bytes (0 = unlimited)<TAB>over the limit 0/1
-#        <TAB>ends at epoch (0 = none yet)<TAB>duration after first connection or -<TAB>first connection epoch<TAB>expired 0/1
+#        <TAB>ends at epoch (0 = none yet)<TAB>duration after first connection or -<TAB>first connection epoch (every
+#        key; 0 = never connected)<TAB>expired 0/1
 #        (keys added by hand or before clients.db existed have no private key: '-')
 cmd_keys() {
     local want="${1:-}"
@@ -1648,13 +1678,13 @@ cmd_keys() {
                 nm = mine ? dbname[ip] : ""
                 h = (pub in hs && hs[pub] + 0 > 0) ? hs[pub] : (pub in ths ? ths[pub] : 0)
                 pol = (ip in ppub && ppub[ip] == pub)
-                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in trx ? trx[pub] : 0), (pub in ttx ? ttx[pub] : 0), h, nm, (pol ? ppa[ip] + 0 : 0), (pol ? plim[ip] + 0 : 0), (pol ? pov[ip] + 0 : 0), (pol ? pex[ip] + 0 : 0), (pol && pdu[ip] != "" ? pdu[ip] : "-"), (pol ? pfi[ip] + 0 : 0), (pol ? ped[ip] + 0 : 0)
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in trx ? trx[pub] : 0), (pub in ttx ? ttx[pub] : 0), h, nm, (pol ? ppa[ip] + 0 : 0), (pol ? plim[ip] + 0 : 0), (pol ? pov[ip] + 0 : 0), (pol ? pex[ip] + 0 : 0), (pol && pdu[ip] != "" ? pdu[ip] : "-"), (pub in tfi && tfi[pub] + 0 > 0 ? tfi[pub] : (pol ? pfi[ip] + 0 : 0)), (pol ? ped[ip] + 0 : 0)
             }
             pub = ""; ip = ""
         }
         FILENAME == ARGV[1] { split($0, f, "\t"); dbpub[f[1]] = f[2]; dbpriv[f[1]] = f[3]; dbtime[f[1]] = f[4]; dbname[f[1]] = f[5]; next }
         FILENAME == ARGV[2] { split($0, f, "\t"); if (FNR > 1) { hs[f[1]] = f[5] }; next }
-        FILENAME == ARGV[3] { split($0, f, "\t"); trx[f[1]] = f[2]; ttx[f[1]] = f[3]; ths[f[1]] = f[4]; next }
+        FILENAME == ARGV[3] { split($0, f, "\t"); trx[f[1]] = f[2]; ttx[f[1]] = f[3]; ths[f[1]] = f[4]; tfi[f[1]] = f[5]; next }
         FILENAME == ARGV[4] { split($0, f, "\t"); ppub[f[1]] = f[2]; ppa[f[1]] = f[3]; plim[f[1]] = f[4]; pov[f[1]] = f[5]
                               pex[f[1]] = f[6]; pdu[f[1]] = f[7]; pfi[f[1]] = f[8]; ped[f[1]] = f[9]; next }
         /^\[/ { flush(); next }
