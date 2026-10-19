@@ -104,7 +104,7 @@ MONITOR_KEY_FILE=""
 MONITOR_MARK="# wg-monitor (install-wg-full.sh)"
 
 BIN_DIR="/usr/local/bin"
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.1.1"
 # the health tools are fetched from this exact commit and must match these hashes (update both together)
 REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/1764dec2a35b2f054217496e9e3ea929ebb59fe0"
 declare -A TOOL_SHA256=(
@@ -165,6 +165,22 @@ warn() { printf '  ⚠ %s\n' "$*" >&2; }
 
 # Usage: die "message"   -> print an error and exit 1
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Usage: green "text"    -> the text in bold green on a terminal (unchanged when piped, or with NO_COLOR set)
+#        Used for the access config lines, so they are easy to find in the long summary.
+green() {
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then printf '\033[1;32m%s\033[0m' "$*"; else printf '%s' "$*"; fi
+}
+
+# Usage: access_line <file> [note] -> prints one saved access config (compact JSON, in green), indented, then the note
+access_line() {
+    [ -f "$1" ] || return 0
+    local j
+    j="$(jq -c . "$1" 2>/dev/null)" || return 0
+    printf '    '
+    green "$j"
+    printf '%s\n' "${2:+   $2}"
+}
 
 # Usage: have <command>  -> 0 if the command exists
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -2388,8 +2404,8 @@ update_api() {
     echo "  keep the old config: re-import it (QR / .conf in the app) to stop IPv6 leaking around the tunnel."
     echo
     echo "  Access config, paste either one into Mithra WireGuard Manager:"
-    [ -f "$ACCESS_FILE" ] && echo "    $(jq -c . "$ACCESS_FILE")"
-    [ -f "$ACCESS_OUTLINE_FILE" ] && echo "    $(jq -c . "$ACCESS_OUTLINE_FILE")"
+    access_line "$ACCESS_FILE"
+    access_line "$ACCESS_OUTLINE_FILE" "(Outline format)"
 }
 
 # Usage: caddy_add_log_filter -> adds the filter that keeps the secret API path and the token out of Caddy's log to a
@@ -2540,8 +2556,8 @@ print_success_message() {
         echo
         echo "  Access config: paste EITHER line into Mithra WireGuard Manager (Add server)."
         echo "  Both open every key on this server. Treat them like passwords."
-        echo "    $(jq -c . "$ACCESS_FILE" 2>/dev/null || true)"
-        [ -f "$ACCESS_OUTLINE_FILE" ] && echo "    $(jq -c . "$ACCESS_OUTLINE_FILE" 2>/dev/null || true)   (Outline format)"
+        access_line "$ACCESS_FILE"
+        access_line "$ACCESS_OUTLINE_FILE" "(Outline format)"
         echo "  (saved in ${ACCESS_FILE} and ${ACCESS_OUTLINE_FILE})"
         echo
         local sep="  ----------------------------------------------------------------------"
