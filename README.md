@@ -133,9 +133,12 @@ curl --insecure --pinnedpubkey "$PIN" "$URL/usage/10.66.0.2" -H "Authorization: 
 * `uploadBytes` / `downloadBytes` are from the **client's** point of view
   (upload = what the client sent to the server).
 * `lastHandshake` is `null` for a key that has never connected.
-* The counters come from the kernel and **reset when `wg0` restarts or the server
-  reboots**. A script that tracks monthly totals should poll regularly and treat a
-  decrease as a reset.
+* Usage is **kept across `wg0` restarts and reboots**. WireGuard's own counters start
+  from zero every time, so the server saves them to `/var/lib/wg-api/traffic.db`
+  every minute (`wg-traffic.timer`) and once more just before `wg0` stops
+  (`wg-traffic-save.service`, on shutdown, reboot and `systemctl restart wg-quick@wg0`),
+  and reports saved + live. A hard power cut can lose at most the last minute.
+  Servers installed before this version get it with `sudo ./install-wg-full.sh --update-api`.
 * To collect usage from several servers, keep each server's domain, HTTPS port,
   token and pin (all in its `access.json`) and poll `/usage` on each.
 
