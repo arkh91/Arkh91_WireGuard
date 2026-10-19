@@ -2860,6 +2860,7 @@ install_all() {
     step_install_firewall
     step_start_wireguard
     step_install_peer_ctrl
+    step_create_api_user
     step_install_monitor
     step_install_api_helper
     step_install_traffic_saver
