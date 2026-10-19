@@ -1703,14 +1703,15 @@ load_existing_settings() {
         DOMAIN="$(sed -n "s/^const ENDPOINT = '\(.*\)';/\1/p" "${API_DIR}/server.js" | head -n1)"
     fi
     [ -n "$DOMAIN" ] || die "Could not read the domain from ${API_DIR}/server.js; pass --domain=NAME."
-    API_TOKEN="$(sed -n 's/^API_TOKEN=//p' "${API_ENV_DIR}/env" 2>/dev/null | head -n1)"
-    [ -n "$API_TOKEN" ] || die "Could not read the API token from ${API_ENV_DIR}/env."
-    API_PATH="$(sed -n 's/^API_PATH=//p' "${API_ENV_DIR}/env" 2>/dev/null | head -n1)"
+    # every read below must survive a missing file: with 'set -e' and 'pipefail' a failing sed would end the script without a word
+    API_TOKEN="$(sed -n 's/^API_TOKEN=//p' "${API_ENV_DIR}/env" 2>/dev/null | head -n1 || true)"
+    [ -n "$API_TOKEN" ] || die "Could not read the API token from ${API_ENV_DIR}/env (is the file there? ls -l ${API_ENV_DIR})."
+    API_PATH="$(sed -n 's/^API_PATH=//p' "${API_ENV_DIR}/env" 2>/dev/null | head -n1 || true)"
     SERVER_PUBLIC_KEY="$(cat /etc/wireguard/server_public.key 2>/dev/null || true)"
     local lp ip addr
-    addr="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*\([0-9.]*\/[0-9]*\).*/\1/p' "$WG_CONFIG" 2>/dev/null | head -n1)"
+    addr="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*\([0-9.]*\/[0-9]*\).*/\1/p' "$WG_CONFIG" 2>/dev/null | head -n1 || true)"
     if [ -n "$addr" ]; then WG_SERVER_ADDR="$addr"; WG_NETWORK="$(cidr_network "$addr")"; fi
-    lp="$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$WG_CONFIG" 2>/dev/null | head -n1)"
+    lp="$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$WG_CONFIG" 2>/dev/null | head -n1 || true)"
     if [ -n "$lp" ]; then WG_PORT="$lp"; fi
     ip="$(sed -n 's/^app\.listen(\([0-9]*\),.*/\1/p' "${API_DIR}/server.js" | head -n1)"
     if [ -n "$ip" ]; then API_PORT_INTERNAL="$ip"; fi
