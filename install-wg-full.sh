@@ -10,12 +10,17 @@
 #     (the installer scans for free ports) with a Bearer token:
 #     POST /create, POST /remove, GET /keys[/<ip>], GET /usage[/<ip>], GET /health,
 #     plus Outline-style routes: GET/POST /access-keys, DELETE /access-keys/<ip>,
-#     PUT /access-keys/<ip>/name, GET /server, GET /metrics/transfer.
+#     PUT /access-keys/<ip>/name, GET /server, GET /metrics/transfer,
+#     pause/resume a key (POST /keys/<ip>/pause, /resume) and a traffic limit per key
+#     (PUT /keys/<ip>/limit {"traffic":"20G"} or "unlimited"; also at create time).
 #     Access config in two formats (Mithra WireGuard Manager takes either):
 #       {"apiUrl":"https://host:port","apiToken":"...","certSha256":"..."}
 #       {"apiUrl":"https://host:port/<secret>","certSha256":"..."}   (exactly Outline's format:
 #        GET <apiUrl>/access-keys returns every key, no header needed)
 #     Nothing listens on port 80.
+#   - /usr/local/bin/wg-firewall.sh    wg0's filter rules, run by wg-quick: clients cannot reach each other,
+#                                      private/metadata networks or the server's own services; paused keys,
+#                                      keys over their traffic limit and suspended ones are dropped first
 #   - /usr/local/bin/wg-peer-ctrl.sh   restricted dispatcher (suspend, limits...)
 #   - /usr/local/bin/wg-healthcheck.sh health check  (from the repo)
 #   - /usr/local/bin/vpn-doctor.sh     diagnose + fix (from the repo)
@@ -31,7 +36,10 @@
 #   sudo ./install-wg-full.sh --add-monitor --monitor-key-file=/root/wg_monitor_key.pub
 #   sudo ./install-wg-full.sh --update-tools         re-fetch healthcheck/doctor scripts
 #   sudo ./install-wg-full.sh --update-api           rewrite wg-api-helper and server.js to this
-#                                                    script's version (adds /usage); keys/peers untouched
+#                                                    script's version, and the firewall rules (as
+#                                                    --update-firewall); keys/peers untouched
+#   sudo ./install-wg-full.sh --update-firewall      install wg-firewall.sh on an older server and
+#                                                    switch wg0.conf to it, live (no restart)
 #   sudo ./install-wg-full.sh --uninstall
 #
 # Options:
@@ -56,11 +64,20 @@
 #   --no-api                 skip Caddy, Node and the API
 #   --no-caddy               install the API but not Caddy; use this when nginx (or another
 #                            web server) already owns 80/443. An nginx snippet is printed.
+#   --allow-client-to-client let VPN clients reach each other (default: blocked)
+#   --allow-private-nets     let VPN clients reach private, link-local (cloud metadata) and CGNAT
+#                            addresses through the server (default: blocked)
 #   --force                  replace an existing wg0.conf (backs it up first)
 #   --yes, -y                do not ask questions
 #
 # healthcheck/doctor are copied from next to this script when present, otherwise
-# downloaded from the GitHub repo (main branch) and syntax-checked first.
+# downloaded from the GitHub repo at a fixed commit and checked against the SHA-256
+# below before they are installed (they run as root).
+#
+# Safer than piping from a branch: download a release, check its SHA-256, then run it:
+#   curl -fsSLo install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/<tag>/install-wg-full.sh
+#   sha256sum install-wg-full.sh      # compare with the release notes
+#   sudo bash install-wg-full.sh
 #
 # Edit this script with: vi install-wg-full.sh
 # =============================================================================
@@ -87,7 +104,23 @@ MONITOR_KEY_FILE=""
 MONITOR_MARK="# wg-monitor (install-wg-full.sh)"
 
 BIN_DIR="/usr/local/bin"
-REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main"
+SCRIPT_VERSION="2.1.0"
+# the health tools are fetched from this exact commit and must match these hashes (update both together)
+REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/1764dec2a35b2f054217496e9e3ea929ebb59fe0"
+declare -A TOOL_SHA256=(
+    [wg-healthcheck.sh]="2568fda3965001df24741d02a87db26acc7e0a97f0a0f6a4112ac8c4acbd1d3f"
+    [vpn-doctor.sh]="6e07438934258fcc2256c2f73838d84f6a2694faddbef9d6c9b0becbbd750575"
+)
+# NodeSource's signing key, only used when the distribution's own nodejs is older than 18
+NODESOURCE_FPR="6F71F525282841EEDAF851B42F59B5F99B1BE0B4"
+# exact npm versions of the API (installed with --ignore-scripts)
+NPM_PACKAGES=(express@4.22.3 express-rate-limit@7.5.1 helmet@8.1.0)
+FW_SCRIPT="${BIN_DIR}/wg-firewall.sh"
+FW_OPTS="/etc/wireguard/wg-firewall.conf"
+FW_ISOLATION=1
+FW_BLOCK_PRIVATE=1
+FW_HOOK_UP="PostUp = ${BIN_DIR}/wg-firewall.sh up"
+FW_HOOK_DOWN="PostDown = ${BIN_DIR}/wg-firewall.sh down"
 # BASH_SOURCE is empty when the script is piped (curl ... | sudo bash -s -- ...), and set -u would stop on it
 SELF="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR="$( [ -n "$SELF" ] && cd "$(dirname "$SELF")" 2>/dev/null && pwd || echo . )"
@@ -105,7 +138,7 @@ ACCESS_OUTLINE_FILE="${API_ENV_DIR}/access-outline.json"
 API_PATH=""
 # how to call this script again in printed hints: run through 'bash <(curl ...)' $0 is /dev/fd/NN
 case "$0" in
-    /dev/fd/*|/proc/*) SELF_CMD="bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh)" ;;
+    /dev/fd/*|/proc/*) SELF_CMD="bash install-wg-full.sh" ;;
     *)                 SELF_CMD="$0" ;;
 esac
 API_URL=""
@@ -191,6 +224,9 @@ parse_args() {
             --network253)         WG_NETWORK="10.66.66.0/24"; WG_SERVER_ADDR="10.66.66.1/24" ;;
             --update-tools)       ACTION="update-tools" ;;
             --update-api)         ACTION="update-api" ;;
+            --update-firewall)    ACTION="update-firewall" ;;
+            --allow-client-to-client) FW_ISOLATION=0 ;;
+            --allow-private-nets) FW_BLOCK_PRIVATE=0 ;;
             --help|-h)            show_help; exit 0 ;;
             *) echo "Unknown argument: $a" >&2; show_help; exit 1 ;;
         esac
@@ -420,15 +456,39 @@ step_install_packages() {
         iproute2 curl openssl gnupg sudo jq ca-certificates dnsutils tcpdump
     if [ "$INSTALL_API" -eq 1 ]; then
         local major=0
-        have node && major="$(node -v | sed 's/^v//; s/\..*//')"
+        have node && major="$(node_major)"
         if [ "$major" -lt 18 ]; then
-            say "Installing Node.js 22 from NodeSource..."
-            curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-            apt-get install -y nodejs
+            # the distribution's own package first (Debian 12, Ubuntu 24.04: Node 18)
+            apt-get install -y nodejs >/dev/null 2>&1 || true
+            have node && major="$(node_major)"
         fi
+        if [ "$major" -lt 18 ]; then install_node_nodesource; fi
         have npm || apt-get install -y npm
         ok "Node $(node -v), npm $(npm -v)"
     fi
+}
+
+# Usage: node_major -> major version of the installed node (0 when missing)
+node_major() { node -v 2>/dev/null | sed 's/^v//; s/\..*//' | grep -E '^[0-9]+$' || echo 0; }
+
+# Usage: install_node_nodesource -> Node.js 22 from NodeSource's apt repository; the signing key must have the
+#        fingerprint in NODESOURCE_FPR (no script is piped into bash)
+install_node_nodesource() {
+    say "Installing Node.js 22 from NodeSource (key ${NODESOURCE_FPR})..."
+    local kr=/usr/share/keyrings/nodesource.gpg tmp got
+    tmp="$(mktemp)"
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o "$tmp" || { rm -f "$tmp"; die "Could not download NodeSource's key."; }
+    got="$(gpg --show-keys --with-colons "$tmp" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
+    if [ "$got" != "$NODESOURCE_FPR" ]; then
+        rm -f "$tmp"
+        die "NodeSource's key has fingerprint '${got:-unknown}', expected ${NODESOURCE_FPR}. Install Node.js 18+ yourself (apt install nodejs) and run again."
+    fi
+    gpg --dearmor --yes -o "$kr" "$tmp"
+    rm -f "$tmp"
+    chmod 644 "$kr"
+    echo "deb [signed-by=${kr}] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+    apt-get update -y
+    apt-get install -y nodejs
 }
 
 # Usage: step_install_caddy -> Caddy from the official apt repo (skipped if already installed)
@@ -471,13 +531,10 @@ ListenPort = ${WG_PORT}
 PrivateKey = ${priv}
 # NAT rule without -o: it keeps working if the uplink is renamed, and
 # '! -d' keeps the server's own traffic to ${WG_SERVER_ADDR%/*} out of MASQUERADE.
-PostUp = iptables -C INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport ${WG_PORT} -j ACCEPT
-PostUp = iptables -C FORWARD -i ${WG_INTERFACE} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ${WG_INTERFACE} -j ACCEPT
-PostUp = iptables -C FORWARD -o ${WG_INTERFACE} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o ${WG_INTERFACE} -j ACCEPT
+# The filter rules (isolation, suspend, INPUT) are made by wg-firewall.sh, always in the same order.
 PostUp = iptables -t nat -C POSTROUTING -s ${WG_NETWORK} ! -d ${WG_NETWORK} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${WG_NETWORK} ! -d ${WG_NETWORK} -j MASQUERADE
-PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
-PostDown = iptables -D FORWARD -i ${WG_INTERFACE} -j ACCEPT 2>/dev/null || true
-PostDown = iptables -D FORWARD -o ${WG_INTERFACE} -j ACCEPT 2>/dev/null || true
+${FW_HOOK_UP}
+${FW_HOOK_DOWN}
 PostDown = iptables -t nat -D POSTROUTING -s ${WG_NETWORK} ! -d ${WG_NETWORK} -j MASQUERADE 2>/dev/null || true
 END
     )
@@ -516,6 +573,232 @@ step_firewall_ufw() {
     fi
     ufw route allow in on "$WG_INTERFACE" out on "$OUT_IFACE" >/dev/null || true
     ok "ufw: ${opened} and routing for ${WG_INTERFACE} (port 80 is not opened)"
+}
+
+# Usage: step_install_firewall -> installs wg-firewall.sh (run by wg-quick PostUp/PostDown) and its options file
+step_install_firewall() {
+    say "Installing wg-firewall.sh..."
+    cat > "${FW_SCRIPT}.new" <<'WG_FIREWALL_EOF'
+#!/bin/bash
+# wg-firewall.sh - the filter rules of wg0, run by wg-quick (PostUp/PostDown) and by wg-api-helper.
+# Installed by install-wg-full.sh; edit the options with: vi /etc/wireguard/wg-firewall.conf
+#
+#   wg-firewall.sh up             (re)apply every rule in a fixed order (idempotent; removes rules of older versions)
+#   wg-firewall.sh down           remove every rule this script made
+#   wg-firewall.sh sync-suspend   rebuild the WG-SUSPEND chain from the saved state (paused / over-limit keys)
+#   wg-firewall.sh status         print the rules
+#
+# FORWARD gets one block at the top, always in this order, so a suspension can never be bypassed:
+#   1  -j WG-SUSPEND                              paused keys, keys over their traffic limit, wg-peer-ctrl suspensions
+#   2  -i wg0 -j WG-GUARD                         no client-to-client, no private / metadata networks
+#   3  -i wg0 -j ACCEPT
+#   4  -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+#   5  -o wg0 -j WG-NOINBOUND                     nothing else may enter the tunnel from outside
+# INPUT gets: udp/<port> ACCEPT, then -i wg0 -j WG-IN (clients may not reach the server's own services).
+# The NAT (MASQUERADE) rule stays in wg0.conf's own PostUp/PostDown lines.
+# The suspend state lives in files, so it survives restarts and reboots without netfilter-persistent:
+#   /etc/wg-api/policy.db          ip<TAB>pubkey<TAB>paused<TAB>limit bytes<TAB>over limit   (wg-api-helper)
+#   /etc/wireguard/suspended.list  one CIDR per line                                         (wg-peer-ctrl.sh)
+set -euo pipefail
+
+WG_IF="wg0"
+WG_CONF="/etc/wireguard/${WG_IF}.conf"
+OPTS="/etc/wireguard/wg-firewall.conf"
+POLICY_DB="/etc/wg-api/policy.db"
+SUSPEND_LIST="/etc/wireguard/suspended.list"
+IPT="$(command -v iptables || echo /usr/sbin/iptables)"
+
+# options (1 = on); /etc/wireguard/wg-firewall.conf may override them
+CLIENT_ISOLATION=1        # clients cannot reach each other
+BLOCK_PRIVATE_NETS=1      # clients cannot reach private, link-local (cloud metadata) or CGNAT addresses
+BLOCK_SERVER_ACCESS=1     # clients cannot open connections to the server itself (ping and DNS still work)
+PRIVATE_NETS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 0.0.0.0/8 127.0.0.0/8 224.0.0.0/4 240.0.0.0/4"
+# shellcheck disable=SC1090
+[ -r "$OPTS" ] && . "$OPTS"
+
+# Usage: wg_port -> prints ListenPort of wg0.conf (empty when missing)
+wg_port() { sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$WG_CONF" 2>/dev/null | head -n1; }
+
+# Usage: our_rules -> one rule per line: "<chain> <iptables arguments>", in the order they must appear (top first)
+our_rules() {
+    local p; p="$(wg_port)"
+    [ -n "$p" ] && echo "INPUT -p udp --dport ${p} -j ACCEPT"
+    [ "$BLOCK_SERVER_ACCESS" = "1" ] && echo "INPUT -i ${WG_IF} -j WG-IN"
+    echo "FORWARD -j WG-SUSPEND"
+    echo "FORWARD -i ${WG_IF} -j WG-GUARD"
+    echo "FORWARD -i ${WG_IF} -j ACCEPT"
+    echo "FORWARD -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+    echo "FORWARD -o ${WG_IF} -j WG-NOINBOUND"
+}
+
+# Usage: legacy_rules -> rules made by older versions of install-wg-full.sh / wg-peer-ctrl.sh (removed on 'up')
+legacy_rules() {
+    echo "FORWARD -i ${WG_IF} -j ACCEPT"
+    echo "FORWARD -o ${WG_IF} -j ACCEPT"
+    echo "FORWARD -j WG-SUSPEND"
+    echo "INPUT -i ${WG_IF} -j WG-IN"
+}
+
+# Usage: del_all "<chain> <args>" -> deletes every copy of one rule
+del_all() {
+    local chain="${1%% *}" args="${1#* }"
+    # intentional word splitting: the rules above are plain tokens
+    # shellcheck disable=SC2086
+    while "$IPT" -D "$chain" $args 2>/dev/null; do :; done
+}
+
+# Usage: remove_rules -> removes our rules and the legacy ones from INPUT/FORWARD
+remove_rules() {
+    local r
+    while IFS= read -r r; do [ -n "$r" ] && del_all "$r"; done < <(our_rules; legacy_rules)
+}
+
+# Usage: valid_cidr <x> -> 0 for a.b.c.d or a.b.c.d/n
+valid_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; }
+
+# Usage: blocked_cidrs -> every address that must be dropped right now (paused, over limit, suspended)
+blocked_cidrs() {
+    if [ -r "$POLICY_DB" ]; then
+        awk -F'\t' '($3 == "1" || $5 == "1") { print $1 "/32" }' "$POLICY_DB"
+    fi
+    if [ -r "$SUSPEND_LIST" ]; then
+        grep -vE '^[[:space:]]*(#|$)' "$SUSPEND_LIST" || true
+    fi
+}
+
+# Usage: sync_suspend -> replaces the content of WG-SUSPEND in one atomic iptables-restore
+sync_suspend() {
+    local c
+    "$IPT" -nL WG-SUSPEND >/dev/null 2>&1 || "$IPT" -N WG-SUSPEND
+    {
+        echo "*filter"
+        echo ":WG-SUSPEND - [0:0]"
+        while IFS= read -r c; do
+            c="${c%%[[:space:]]*}"
+            valid_cidr "$c" || continue
+            echo "-A WG-SUSPEND -s ${c} -j DROP"
+            echo "-A WG-SUSPEND -d ${c} -j DROP"
+        done < <(blocked_cidrs | sort -u)
+        echo "COMMIT"
+    } | "${IPT}-restore" --noflush
+}
+
+# Usage: fill_chain <name> <rule args>... -> creates/flushes a chain and appends the given rules (one per argument)
+fill_chain() {
+    local name="$1" r; shift
+    "$IPT" -nL "$name" >/dev/null 2>&1 || "$IPT" -N "$name"
+    "$IPT" -F "$name"
+    # shellcheck disable=SC2086
+    for r in "$@"; do "$IPT" -A "$name" $r; done
+}
+
+# Usage: up -> builds the chains, then puts our block at the top of INPUT and FORWARD
+up() {
+    local guard=() n r i
+    [ "$CLIENT_ISOLATION" = "1" ] && guard+=("-o ${WG_IF} -j DROP")
+    if [ "$BLOCK_PRIVATE_NETS" = "1" ]; then
+        for n in $PRIVATE_NETS; do guard+=("-d ${n} -j DROP"); done
+    fi
+    fill_chain WG-GUARD "${guard[@]}"
+    fill_chain WG-NOINBOUND "-j DROP"
+    fill_chain WG-IN "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "-p icmp -j ACCEPT" \
+        "-p udp --dport 53 -j ACCEPT" "-p tcp --dport 53 -j ACCEPT" "-j DROP"
+    sync_suspend
+    remove_rules
+    # insert bottom-up at position 1 so the final order is exactly our_rules' order
+    mapfile -t r < <(our_rules)
+    for (( i = ${#r[@]} - 1; i >= 0; i-- )); do
+        # shellcheck disable=SC2086
+        "$IPT" -I "${r[$i]%% *}" 1 ${r[$i]#* }
+    done
+}
+
+# Usage: down -> removes everything 'up' made
+down() {
+    local c
+    remove_rules
+    for c in WG-SUSPEND WG-GUARD WG-NOINBOUND WG-IN; do
+        "$IPT" -F "$c" 2>/dev/null || true
+        "$IPT" -X "$c" 2>/dev/null || true
+    done
+}
+
+case "${1:-}" in
+    up)           up ;;
+    down)         down ;;
+    sync-suspend) sync_suspend ;;
+    status)       "$IPT" -S INPUT; "$IPT" -S FORWARD; for c in WG-SUSPEND WG-GUARD WG-NOINBOUND WG-IN; do "$IPT" -S "$c" 2>/dev/null || true; done ;;
+    *)            echo "usage: wg-firewall.sh up|down|sync-suspend|status" >&2; exit 1 ;;
+esac
+WG_FIREWALL_EOF
+    bash -n "${FW_SCRIPT}.new" || { rm -f "${FW_SCRIPT}.new"; die "wg-firewall.sh failed its syntax check."; }
+    install -o root -g root -m 755 "${FW_SCRIPT}.new" "$FW_SCRIPT"
+    rm -f "${FW_SCRIPT}.new"
+    mkdir -p /etc/wireguard
+    if [ ! -f "$FW_OPTS" ]; then
+        ( umask 077; cat > "$FW_OPTS" <<END
+# Options of ${FW_SCRIPT} (1 = on). Apply a change with: ${FW_SCRIPT} up
+CLIENT_ISOLATION=${FW_ISOLATION}       # VPN clients cannot reach each other
+BLOCK_PRIVATE_NETS=${FW_BLOCK_PRIVATE}     # nor private, link-local (cloud metadata) or CGNAT addresses
+BLOCK_SERVER_ACCESS=1    # nor the server's own services (ping and DNS still work)
+END
+        )
+    fi
+    touch /etc/wireguard/suspended.list
+    chmod 600 /etc/wireguard/suspended.list
+    ok "${FW_SCRIPT} (options: ${FW_OPTS})"
+}
+
+# Usage: migrate_wg_hooks -> switches the PostUp/PostDown lines of an existing wg0.conf to wg-firewall.sh
+#        (the old filter lines are dropped, the NAT lines and every peer are kept; validated before it is replaced)
+migrate_wg_hooks() {
+    [ -f "$WG_CONFIG" ] || die "$WG_CONFIG is missing."
+    local tmpd tmp
+    tmpd="$(mktemp -d)"; tmp="${tmpd}/${WG_INTERFACE}.conf"
+    (
+        # the API helper edits wg0.conf under this lock
+        exec 9>/run/wg-api-helper.lock
+        flock 9
+        awk -v up="$FW_HOOK_UP" -v down="$FW_HOOK_DOWN" -v ifc="$WG_INTERFACE" '
+            function hooks() { if (!done) { print up; print down; done = 1 } }
+            /^\[Peer\]/ { hooks() }
+            /^(PostUp|PostDown)[ \t]*=/ {
+                if ($0 ~ /wg-firewall\.sh/) next
+                if ($0 ~ ("FORWARD -[io] " ifc " -j ACCEPT")) next
+                if ($0 ~ /INPUT (1 )?-p udp --dport [0-9]+ -j ACCEPT/) next
+            }
+            { print }
+            END { hooks() }
+        ' "$WG_CONFIG" > "$tmp"
+        wg-quick strip "$tmp" >/dev/null 2>&1 || { rm -rf "$tmpd"; die "The rewritten ${WG_CONFIG} does not validate; nothing changed."; }
+        if ! cmp -s "$tmp" "$WG_CONFIG"; then
+            cp -a "$WG_CONFIG" "${WG_CONFIG}.bak-$(date +%Y%m%d-%H%M%S)"
+            install -o root -g root -m 600 "$tmp" "${WG_CONFIG}.new"
+            mv -f "${WG_CONFIG}.new" "$WG_CONFIG"
+        fi
+    )
+    rm -rf "$tmpd"
+}
+
+# Usage: import_live_suspensions -> keeps suspensions that older versions only had in iptables (WG-SUSPEND rules)
+import_live_suspensions() {
+    local c
+    iptables -nL WG-SUSPEND >/dev/null 2>&1 || return 0
+    while IFS= read -r c; do
+        grep -qxF "$c" /etc/wireguard/suspended.list 2>/dev/null || printf '%s\n' "$c" >> /etc/wireguard/suspended.list
+    done < <(iptables -S WG-SUSPEND | sed -n 's/^-A WG-SUSPEND -s \([0-9./]*\) -j DROP$/\1/p')
+}
+
+# Usage: update_firewall -> installs wg-firewall.sh on an existing server and applies it live (no restart, peers kept)
+update_firewall() {
+    [ -f "$WG_CONFIG" ] || die "No ${WG_CONFIG}: run a normal install first."
+    step_install_firewall
+    import_live_suspensions
+    migrate_wg_hooks
+    "$FW_SCRIPT" up || die "wg-firewall.sh up failed: ${FW_SCRIPT} status"
+    # the rules no longer depend on netfilter-persistent; save once so an old saved set cannot come back at boot
+    have netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+    ok "Firewall updated: clients isolated, private networks blocked, suspensions always evaluated first"
 }
 
 # Usage: step_start_wireguard -> enables and starts wg-quick@wg0 and checks the interface
@@ -573,6 +856,8 @@ WG="/usr/bin/wg"
 IPT="/sbin/iptables"
 TC="/sbin/tc"
 SUSPEND_CHAIN="WG-SUSPEND"
+FW="/usr/local/bin/wg-firewall.sh"
+SUSPEND_LIST="/etc/wireguard/suspended.list"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VALIDATION
@@ -611,9 +896,24 @@ ensure_suspend_chain() {
 }
 
 # Usage: persist_iptables
-# Saves iptables state so suspensions survive a reboot. No-op if unavailable.
+# Saves iptables state so suspensions survive a reboot. No-op if unavailable (only used without wg-firewall.sh).
 persist_iptables() {
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+}
+
+# Usage: suspend_list add|del <cidr>
+# With wg-firewall.sh the suspension is kept in /etc/wireguard/suspended.list and WG-SUSPEND is rebuilt from it,
+# so it survives wg0 restarts and reboots and always sits above the ACCEPT rules. Returns 1 without wg-firewall.sh.
+suspend_list() {
+    [ -x "$FW" ] || return 1
+    local tmp
+    touch "$SUSPEND_LIST"; chmod 600 "$SUSPEND_LIST"
+    tmp="$(mktemp)"
+    grep -vxF "$2" "$SUSPEND_LIST" > "$tmp" || true
+    [ "$1" = "add" ] && printf '%s\n' "$2" >> "$tmp"
+    install -o root -g root -m 600 "$tmp" "$SUSPEND_LIST"
+    rm -f "$tmp"
+    "$FW" sync-suspend
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -706,10 +1006,12 @@ case "${ARGS[0]:-}" in
         [[ "$NARGS" -eq 2 ]] || { echo "ERROR: usage: peer-suspend <cidr>" >&2; audit DENY "reason=argc"; exit 1; }
         IP="${ARGS[1]}"
         is_valid_cidr "$IP" || { echo "ERROR: invalid IP/CIDR" >&2; audit DENY "reason=bad_cidr"; exit 1; }
-        ensure_suspend_chain
-        "$IPT" -C "$SUSPEND_CHAIN" -s "$IP" -j DROP 2>/dev/null || "$IPT" -A "$SUSPEND_CHAIN" -s "$IP" -j DROP
-        "$IPT" -C "$SUSPEND_CHAIN" -d "$IP" -j DROP 2>/dev/null || "$IPT" -A "$SUSPEND_CHAIN" -d "$IP" -j DROP
-        persist_iptables
+        if ! suspend_list add "$IP"; then
+            ensure_suspend_chain
+            "$IPT" -C "$SUSPEND_CHAIN" -s "$IP" -j DROP 2>/dev/null || "$IPT" -A "$SUSPEND_CHAIN" -s "$IP" -j DROP
+            "$IPT" -C "$SUSPEND_CHAIN" -d "$IP" -j DROP 2>/dev/null || "$IPT" -A "$SUSPEND_CHAIN" -d "$IP" -j DROP
+            persist_iptables
+        fi
         echo "OK: iptables DROP in place for $IP"
         audit OK "action=suspend ip=${IP}"
         ;;
@@ -718,10 +1020,12 @@ case "${ARGS[0]:-}" in
         [[ "$NARGS" -eq 2 ]] || { echo "ERROR: usage: peer-unsuspend <cidr>" >&2; audit DENY "reason=argc"; exit 1; }
         IP="${ARGS[1]}"
         is_valid_cidr "$IP" || { echo "ERROR: invalid IP/CIDR" >&2; audit DENY "reason=bad_cidr"; exit 1; }
-        ensure_suspend_chain
-        "$IPT" -C "$SUSPEND_CHAIN" -s "$IP" -j DROP 2>/dev/null && "$IPT" -D "$SUSPEND_CHAIN" -s "$IP" -j DROP || true
-        "$IPT" -C "$SUSPEND_CHAIN" -d "$IP" -j DROP 2>/dev/null && "$IPT" -D "$SUSPEND_CHAIN" -d "$IP" -j DROP || true
-        persist_iptables
+        if ! suspend_list del "$IP"; then
+            ensure_suspend_chain
+            "$IPT" -C "$SUSPEND_CHAIN" -s "$IP" -j DROP 2>/dev/null && "$IPT" -D "$SUSPEND_CHAIN" -s "$IP" -j DROP || true
+            "$IPT" -C "$SUSPEND_CHAIN" -d "$IP" -j DROP 2>/dev/null && "$IPT" -D "$SUSPEND_CHAIN" -d "$IP" -j DROP || true
+            persist_iptables
+        fi
         echo "OK: iptables DROP removed for $IP"
         audit OK "action=unsuspend ip=${IP}"
         ;;
@@ -845,10 +1149,17 @@ step_install_api_helper() {
 # wg-api-helper - root-owned helper for wg-api. Called through sudo; it is the
 # only thing the API user may run as root and it accepts only these commands:
 #   wg-api-helper used-ips              every client address already in wg0.conf
-#   wg-api-helper add-auto <pubkey>     pick the first free address, add the peer, print the address
+#   wg-api-helper add-auto <pubkey> [<name>] [<ip>] [<limit bytes>]
+#                                       add the peer at <ip> (or the first free address), print the address
 #                                       (the client's private key may be given on stdin; it is kept in
 #                                        /etc/wg-api/clients.db, root only, so GET /keys can show the config again)
-#   wg-api-helper keys [<ip>]           every peer: ip, pubkey, stored private key, created, rx, tx, handshake, name
+#   wg-api-helper keys [<ip>]           every peer: ip, pubkey, stored private key, created, rx, tx, handshake, name,
+#                                       paused (0/1), traffic limit in bytes (0 = unlimited), over the limit (0/1)
+#   wg-api-helper pause <ip>            block all traffic of a key (it stays configured; resume undoes it)
+#   wg-api-helper resume <ip>           lift a pause
+#   wg-api-helper limit <ip> <bytes>    traffic limit of a key, upload + download since it was created; 0 = unlimited.
+#                                       A key over its limit is blocked like a paused one (checked now and every
+#                                       minute by traffic-save) and unblocked when the limit is raised or removed.
 #   wg-api-helper rename <ip> <name>    give a key a display name (1-64 characters, no control characters)
 #   wg-api-helper add <pubkey> <ip>     add a peer to wg0.conf AND the live interface
 #   wg-api-helper remove <ip>           remove a peer from wg0.conf AND the live interface
@@ -861,7 +1172,9 @@ set -euo pipefail
 WG_IF="wg0"
 WG_CONF="/etc/wireguard/${WG_IF}.conf"
 CLIENT_DB="/etc/wg-api/clients.db"   # ip<TAB>client pubkey<TAB>client private key or -<TAB>created epoch<TAB>name
-TRAFFIC_DB="/var/lib/wg-api/traffic.db"   # pubkey<TAB>saved rx<TAB>saved tx<TAB>last live rx<TAB>last live tx<TAB>generation
+TRAFFIC_DB="/var/lib/wg-api/traffic.db"   # pubkey<TAB>saved rx<TAB>saved tx<TAB>last live rx<TAB>last live tx<TAB>generation<TAB>last handshake
+POLICY_DB="/etc/wg-api/policy.db"   # ip<TAB>pubkey<TAB>paused 0/1<TAB>limit bytes (0 = unlimited)<TAB>over the limit 0/1
+FW="/usr/local/bin/wg-firewall.sh"
 
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
@@ -975,6 +1288,7 @@ cmd_remove() {
     ' "$WG_CONF" > "$WORK"
     install_conf "$WORK"
     db_drop "$ip"
+    pol_drop "$ip"
     logger -t wg-api-helper "result=OK action=remove ip=${ip}"
     echo "OK: peer removed ($ip)"
 }
@@ -996,22 +1310,24 @@ traffic_gen() {
 traffic_merge() {
     if [ -f "$TRAFFIC_DB" ]; then cp "$TRAFFIC_DB" "$TMPD/traffic"; else : > "$TMPD/traffic"; fi
     awk -F'\t' -v mode="$1" -v gen="$(traffic_gen)" '
-        FILENAME == ARGV[1] { if (NF >= 6) { brx[$1] = $2; btx[$1] = $3; lrx[$1] = $4; ltx[$1] = $5; g[$1] = $6 }; next }
-        FILENAME == ARGV[2] { if (FNR > 1) { live[$1] = 1; crx[$1] = $6; ctx[$1] = $7 }; next }
+        FILENAME == ARGV[1] { if (NF >= 6) { brx[$1] = $2; btx[$1] = $3; lrx[$1] = $4; ltx[$1] = $5; g[$1] = $6; shs[$1] = (NF >= 7 ? $7 : 0) }; next }
+        FILENAME == ARGV[2] { if (FNR > 1) { live[$1] = 1; crx[$1] = $6; ctx[$1] = $7; chs[$1] = $5 }; next }
         /^PublicKey[ \t]*=/ { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); conf[v] = 1; next }
         END {
             for (p in conf) {
+                # the last handshake is kept too, so "last seen" survives a restart (live value when there is one)
+                h = (p in chs && chs[p] + 0 > 0) ? chs[p] : ((p in shs) ? shs[p] + 0 : 0)
                 if (p in live) {
                     b_rx = (p in brx) ? brx[p] + 0 : 0; b_tx = (p in btx) ? btx[p] + 0 : 0
                     if ((p in g) && (g[p] != gen || crx[p] + 0 < lrx[p] + 0 || ctx[p] + 0 < ltx[p] + 0)) {
                         b_rx += lrx[p]; b_tx += ltx[p]
                     }
-                    if (mode == "save") printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\n", p, b_rx, b_tx, crx[p], ctx[p], gen
-                    else printf "%s\t%.0f\t%.0f\n", p, b_rx + crx[p], b_tx + ctx[p]
+                    if (mode == "save") printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\t%.0f\n", p, b_rx, b_tx, crx[p], ctx[p], gen, h
+                    else printf "%s\t%.0f\t%.0f\t%.0f\n", p, b_rx + crx[p], b_tx + ctx[p], h
                 } else if (p in brx) {
                     # wg0 is down (or the peer is not loaded): keep what was saved
-                    if (mode == "save") printf "%s\t%s\t%s\t%s\t%s\t%s\n", p, brx[p], btx[p], lrx[p], ltx[p], g[p]
-                    else printf "%s\t%.0f\t%.0f\n", p, brx[p] + lrx[p], btx[p] + ltx[p]
+                    if (mode == "save") printf "%s\t%s\t%s\t%s\t%s\t%s\t%.0f\n", p, brx[p], btx[p], lrx[p], ltx[p], g[p], h
+                    else printf "%s\t%.0f\t%.0f\t%.0f\n", p, brx[p] + lrx[p], btx[p] + ltx[p], h
                 }
             }
         }' "$TMPD/traffic" "$TMPD/dump" "$WG_CONF"
@@ -1024,6 +1340,95 @@ cmd_traffic_save() {
     traffic_merge save > "$TMPD/traffic.new"
     install -o root -g root -m 600 "$TMPD/traffic.new" "${TRAFFIC_DB}.new"
     mv -f "${TRAFFIC_DB}.new" "$TRAFFIC_DB"
+    enforce_limits
+}
+
+# Usage: load_dump              -> writes the live 'wg show dump' to $TMPD/dump (empty when wg0 is down)
+load_dump() { { wg show "$WG_IF" dump 2>/dev/null || true; } > "$TMPD/dump"; }
+
+# Usage: pol_write <file>       -> atomically replaces policy.db with <file> (rows of keys no longer in wg0.conf dropped)
+pol_write() {
+    install -d -o root -g root -m 700 "$(dirname "$POLICY_DB")"
+    awk -F'\t' '
+        FILENAME == ARGV[1] { if ($0 ~ /^PublicKey[ \t]*=/) { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); conf[v] = 1 }; next }
+        ($2 in conf) && ($3 == "1" || $4 + 0 > 0)
+    ' "$WG_CONF" "$1" > "$TMPD/policy.clean"
+    install -o root -g root -m 600 "$TMPD/policy.clean" "${POLICY_DB}.new"
+    mv -f "${POLICY_DB}.new" "$POLICY_DB"
+}
+
+# Usage: fw_sync                -> applies policy.db to the firewall (WG-SUSPEND), if wg-firewall.sh is installed
+fw_sync() {
+    if [ -x "$FW" ]; then "$FW" sync-suspend || fail "could not update the firewall (wg-firewall.sh sync-suspend)"; fi
+}
+
+# Usage: pol_set <ip> <pubkey> <paused|-> <limit|->  -> changes one key's policy ('-' keeps the current value),
+#                                  works out "over the limit" from the saved + live traffic, applies the firewall
+pol_set() {
+    local ip="$1" pub="$2" paused="$3" limit="$4"
+    [ -f "$POLICY_DB" ] && cp "$POLICY_DB" "$TMPD/policy" || : > "$TMPD/policy"
+    load_dump
+    traffic_merge totals > "$TMPD/totals"
+    awk -F'\t' -v OFS='\t' -v ip="$ip" -v pub="$pub" -v paused="$paused" -v limit="$limit" '
+        FILENAME == ARGV[1] { tot[$1] = $2 + $3; next }
+        $1 == ip { op = $3; ol = $4; next }
+        { print }
+        END {
+            p = (paused == "-") ? (op == "" ? 0 : op) : paused
+            l = (limit == "-") ? (ol == "" ? 0 : ol) : limit
+            over = (l + 0 > 0 && (tot[pub] + 0) >= l + 0) ? 1 : 0
+            print ip, pub, p, l, over
+        }' "$TMPD/totals" "$TMPD/policy" > "$TMPD/policy.new"
+    pol_write "$TMPD/policy.new"
+    fw_sync
+}
+
+# Usage: enforce_limits         -> after traffic-save: blocks keys that reached their limit, unblocks the ones below it
+enforce_limits() {
+    [ -s "$POLICY_DB" ] || return 0
+    traffic_merge totals > "$TMPD/totals"
+    if awk -F'\t' -v OFS='\t' '
+            FILENAME == ARGV[1] { tot[$1] = $2 + $3; next }
+            { over = ($4 + 0 > 0 && (tot[$2] + 0) >= $4 + 0) ? 1 : 0; if (over != $5 + 0) changed = 1; print $1, $2, $3, $4, over }
+            END { exit changed ? 0 : 1 }' "$TMPD/totals" "$POLICY_DB" > "$TMPD/policy.new"; then
+        pol_write "$TMPD/policy.new"
+        fw_sync
+        logger -t wg-api-helper "result=OK action=enforce-limits"
+    fi
+}
+
+# Usage: pol_drop <ip>          -> forgets the policy of a removed key
+pol_drop() {
+    [ -f "$POLICY_DB" ] || return 0
+    awk -F'\t' -v ip="$1" '$1 != ip' "$POLICY_DB" > "$TMPD/policy.drop"
+    pol_write "$TMPD/policy.drop"
+    fw_sync
+}
+
+# Usage: valid_bytes <n>        -> 0 for a whole number of bytes, 0 to 10^18
+valid_bytes() { [[ "$1" =~ ^(0|[1-9][0-9]{0,17})$ ]]; }
+
+# Usage: key_of <ip>            -> prints the public key of an existing peer, fails when there is none
+key_of() {
+    local pub
+    is_valid_ip "$1" || fail "invalid ip"
+    pub="$(peer_key_for_ip "$1")"
+    [ -n "$pub" ] || fail "no peer found with AllowedIPs ${1}/32"
+    printf '%s' "$pub"
+}
+
+# Usage: cmd_pause <ip> / cmd_resume <ip>
+cmd_pause()  { local pub; pub="$(key_of "$1")"; pol_set "$1" "$pub" 1 -; logger -t wg-api-helper "result=OK action=pause ip=$1"; echo "OK: paused ($1)"; }
+cmd_resume() { local pub; pub="$(key_of "$1")"; pol_set "$1" "$pub" 0 -; logger -t wg-api-helper "result=OK action=resume ip=$1"; echo "OK: resumed ($1)"; }
+
+# Usage: cmd_limit <ip> <bytes> -> 0 removes the limit
+cmd_limit() {
+    local pub
+    valid_bytes "$2" || fail "invalid limit"
+    pub="$(key_of "$1")"
+    pol_set "$1" "$pub" - "$2"
+    logger -t wg-api-helper "result=OK action=limit ip=$1 bytes=$2"
+    echo "OK: limit $2 ($1)"
 }
 
 # Usage: traffic_drop <pubkey>  -> forgets the saved traffic of a removed key
@@ -1078,33 +1483,42 @@ cmd_rename() {
     echo "OK: renamed ($ip)"
 }
 
-# Usage: echo "<privkey>" | cmd_add_auto <pubkey> [<name>]
-#                               -> picks the first free address and adds the peer under the same lock; prints the address.
-#                                  The optional private key on stdin must belong to <pubkey>; it is stored for GET /keys.
+# Usage: echo "<privkey>" | cmd_add_auto <pubkey> [<name>] [<ip>] [<limit bytes>]
+#                               -> adds the peer at <ip>, or at the first free address, under the same lock; prints the
+#                                  address. The optional private key on stdin must belong to <pubkey>; it is stored for
+#                                  GET /keys. Empty <name>/<ip>/<limit> mean: none / pick one / unlimited.
 cmd_add_auto() {
-    local pub="$1" name="${2:-}" ip priv=""
+    local pub="$1" name="${2:-}" want="${3:-}" limit="${4:-}" ip priv=""
     is_valid_pubkey "$pub" || fail "invalid public key"
     if [ -n "$name" ]; then valid_name "$name" || fail "invalid name"; fi
+    if [ -n "$want" ]; then
+        is_valid_ip "$want" || fail "invalid ip"
+        if grep -Eq "^AllowedIPs[[:space:]]*=[[:space:]]*${want//./\\.}/32[[:space:]]*\$" "$WG_CONF"; then fail "ip already allocated: $want"; fi
+    fi
+    if [ -n "$limit" ]; then valid_bytes "$limit" || fail "invalid limit"; fi
     if [ ! -t 0 ]; then IFS= read -r priv || true; fi
     if [ -n "$priv" ]; then
         is_valid_pubkey "$priv" || fail "invalid private key"
         [ "$(printf '%s' "$priv" | wg pubkey 2>/dev/null)" = "$pub" ] || fail "private key does not match the public key"
     fi
-    ip="$(next_free_ip)" || fail "IP pool exhausted"
+    if [ -n "$want" ]; then ip="$want"; else ip="$(next_free_ip)" || fail "IP pool exhausted"; fi
     cmd_add "$pub" "$ip" >/dev/null
     db_put "$ip" "$pub" "${priv:--}" "" "$name"
+    if [ -n "$limit" ] && [ "$limit" != "0" ]; then pol_set "$ip" "$pub" 0 "$limit"; fi
     echo "$ip"
 }
 
 # Usage: cmd_keys [<ip>]        -> one line per peer in wg0.conf:
 #        ip<TAB>client pubkey<TAB>private key or -<TAB>created epoch or 0<TAB>rx<TAB>tx<TAB>last handshake epoch<TAB>name
+#        <TAB>paused 0/1<TAB>limit bytes (0 = unlimited)<TAB>over the limit 0/1
 #        (keys added by hand or before clients.db existed have no private key: '-')
 cmd_keys() {
     local want="${1:-}"
     if [ -n "$want" ]; then is_valid_ip "$want" || fail "invalid ip"; fi
-    { wg show "$WG_IF" dump 2>/dev/null || true; } > "$TMPD/dump"
+    load_dump
     traffic_merge totals > "$TMPD/totals"
     if [ -f "$CLIENT_DB" ]; then cp "$CLIENT_DB" "$TMPD/db"; else : > "$TMPD/db"; fi
+    if [ -f "$POLICY_DB" ]; then cp "$POLICY_DB" "$TMPD/pol"; else : > "$TMPD/pol"; fi
     awk -v want="$want" '
         function flush() {
             if (pub != "" && ip != "" && (want == "" || ip == want)) {
@@ -1112,20 +1526,23 @@ cmd_keys() {
                 p = mine ? dbpriv[ip] : "-"
                 c = mine ? dbtime[ip] : 0
                 nm = mine ? dbname[ip] : ""
-                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in trx ? trx[pub] : 0), (pub in ttx ? ttx[pub] : 0), (pub in hs ? hs[pub] : 0), nm
+                h = (pub in hs && hs[pub] + 0 > 0) ? hs[pub] : (pub in ths ? ths[pub] : 0)
+                pol = (ip in ppub && ppub[ip] == pub)
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in trx ? trx[pub] : 0), (pub in ttx ? ttx[pub] : 0), h, nm, (pol ? ppa[ip] + 0 : 0), (pol ? plim[ip] + 0 : 0), (pol ? pov[ip] + 0 : 0)
             }
             pub = ""; ip = ""
         }
         FILENAME == ARGV[1] { split($0, f, "\t"); dbpub[f[1]] = f[2]; dbpriv[f[1]] = f[3]; dbtime[f[1]] = f[4]; dbname[f[1]] = f[5]; next }
         FILENAME == ARGV[2] { split($0, f, "\t"); if (FNR > 1) { hs[f[1]] = f[5] }; next }
-        FILENAME == ARGV[3] { split($0, f, "\t"); trx[f[1]] = f[2]; ttx[f[1]] = f[3]; next }
+        FILENAME == ARGV[3] { split($0, f, "\t"); trx[f[1]] = f[2]; ttx[f[1]] = f[3]; ths[f[1]] = f[4]; next }
+        FILENAME == ARGV[4] { split($0, f, "\t"); ppub[f[1]] = f[2]; ppa[f[1]] = f[3]; plim[f[1]] = f[4]; pov[f[1]] = f[5]; next }
         /^\[/ { flush(); next }
         /^PublicKey[ \t]*=/  { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); pub = v; next }
         /^AllowedIPs[ \t]*=/ { v = $0; sub(/^AllowedIPs[ \t]*=[ \t]*/, "", v); n = split(v, a, /[ \t]*,[ \t]*/)
                                for (i = 1; i <= n; i++) if (a[i] ~ /\/32$/) { sub(/\/32$/, "", a[i]); ip = a[i]; break }
                                next }
         END { flush() }
-    ' "$TMPD/db" "$TMPD/dump" "$TMPD/totals" "$WG_CONF"
+    ' "$TMPD/db" "$TMPD/dump" "$TMPD/totals" "$TMPD/pol" "$WG_CONF"
 }
 
 exec 9>/run/wg-api-helper.lock
@@ -1135,7 +1552,10 @@ load_network
 case "${1:-}" in
     used-ips) [ "$#" -eq 1 ] || fail "usage: used-ips";           cmd_used_ips ;;
     add)      [ "$#" -eq 3 ] || fail "usage: add <pubkey> <ip>";  cmd_add "$2" "$3" ;;
-    add-auto) [ "$#" -ge 2 ] && [ "$#" -le 3 ] || fail "usage: add-auto <pubkey> [<name>]"; cmd_add_auto "$2" "${3:-}" ;;
+    add-auto) [ "$#" -ge 2 ] && [ "$#" -le 5 ] || fail "usage: add-auto <pubkey> [<name>] [<ip>] [<limit bytes>]"; cmd_add_auto "$2" "${3:-}" "${4:-}" "${5:-}" ;;
+    pause)    [ "$#" -eq 2 ] || fail "usage: pause <ip>";         cmd_pause "$2" ;;
+    resume)   [ "$#" -eq 2 ] || fail "usage: resume <ip>";        cmd_resume "$2" ;;
+    limit)    [ "$#" -eq 3 ] || fail "usage: limit <ip> <bytes>"; cmd_limit "$2" "$3" ;;
     rename)   [ "$#" -eq 3 ] || fail "usage: rename <ip> <name>"; cmd_rename "$2" "$3" ;;
     keys)     [ "$#" -le 2 ] || fail "usage: keys [<ip>]";        cmd_keys "${2:-}" ;;
     remove)   [ "$#" -eq 2 ] || fail "usage: remove <ip>";        cmd_remove "$2" ;;
@@ -1224,10 +1644,18 @@ step_api_npm_setup() {
     mkdir -p "$API_DIR"
     cd "$API_DIR"
     [ -f package.json ] || npm init -y >/dev/null 2>&1
-    npm install --omit=dev --no-audit --no-fund express express-rate-limit helmet >/dev/null 2>&1 \
+    # exact versions, and no install scripts run as root
+    npm install --omit=dev --no-audit --no-fund --ignore-scripts --save-exact "${NPM_PACKAGES[@]}" >/dev/null 2>&1 \
         || die "npm install failed in $API_DIR"
-    chown -R "${API_USER}:${API_USER}" "$API_DIR"
-    ok "express, express-rate-limit, helmet installed"
+    api_dir_perms
+    ok "${NPM_PACKAGES[*]} installed"
+}
+
+# Usage: api_dir_perms -> the API's code belongs to root and is read-only for the service user, so a compromised
+#        wg-api process cannot rewrite its own code
+api_dir_perms() {
+    chown -R root:root "$API_DIR"
+    chmod -R u=rwX,go=rX "$API_DIR"
 }
 
 # Usage: step_generate_token -> creates the Bearer token once and keeps it in /etc/wg-api/env (mode 600)
@@ -1297,7 +1725,9 @@ const CLIENT_DNS = '__DNS__';
 // WG_API_HELPER: test override only; in production sudoers allows nothing but the real path
 const HELPER = process.env.WG_API_HELPER || '/usr/local/bin/wg-api-helper';
 // reported by GET /server; Mithra WireGuard Manager uses it to know which routes exist
-const API_VERSION = '2.0';
+const API_VERSION = '2.1';
+// what this server can do beyond listing/creating/removing keys (the app shows the matching buttons)
+const FEATURES = ['names', 'pause', 'limit', 'createAt'];
 const STARTED_MS = Date.now();
 
 // Usage: sameSecret(a, b) -> true if two strings are equal (constant time)
@@ -1313,7 +1743,8 @@ function tokenOk(header) {
     return given.length === expected.length && crypto.timingSafeEqual(given, expected);
 }
 
-const CLIENT_ALLOWED_IPS = '0.0.0.0/0';
+// ::/0 as well: IPv6 is sent into the tunnel (and dropped there) instead of leaking around it
+const CLIENT_ALLOWED_IPS = '0.0.0.0/0, ::/0';
 const CLIENT_KEEPALIVE = 25;
 
 // Usage: helper(['add', pubkey, ip], stdinText?) -> runs wg-api-helper as root through sudo, no shell involved
@@ -1336,10 +1767,43 @@ function buildConfig(privateKey, ip) {
         'PersistentKeepalive = ' + CLIENT_KEEPALIVE + '\n';
 }
 
-// Usage: keyObject({ip, publicKey, privateKey, created, rx, tx, hs}) -> one key as returned by /keys and /create?format=json
-//        privateKey/config are null for keys whose private key the server never saw (added by hand or by an older version)
+// Usage: parseTraffic("20G") -> 20000000000; "unlimited" / "0" / 0 / null -> 0; undefined for anything invalid
+//        Units are decimal like the app shows them (K M G T = 10^3 ... 10^12; KiB MiB GiB TiB = 1024^n),
+//        a plain number is bytes. Also accepts Outline's {"bytes": N}.
+function parseTraffic(v) {
+    if (v === null || v === 0 || v === false) return 0;
+    if (typeof v === 'object' && v !== null && 'bytes' in v) v = v.bytes;
+    if (typeof v === 'number') return Number.isSafeInteger(v) && v >= 0 && v <= 1e18 ? v : undefined;
+    if (typeof v !== 'string') return undefined;
+    const t = v.trim();
+    if (/^(|0|unlimited|none|off|no)$/i.test(t)) return 0;
+    const m = /^(\d+(?:\.\d+)?)\s*([kmgt]?)(i?)b?$/i.exec(t);
+    if (!m) return undefined;
+    const pow = { '': 0, k: 1, m: 2, g: 3, t: 4 }[m[2].toLowerCase()];
+    const bytes = Math.round(parseFloat(m[1]) * Math.pow(m[3] ? 1024 : 1000, pow));
+    return Number.isSafeInteger(bytes) && bytes <= 1e18 ? bytes : undefined;
+}
+
+// Usage: trafficFrom(req) -> the requested limit in bytes (0 = unlimited), undefined when none was given,
+//        or NaN when it was given but is not valid. Body {"traffic":"20G"}, {"limit":{"bytes":N}} (Outline),
+//        {"dataLimit":N}, or ?traffic=20G.
+function trafficFrom(req) {
+    const b = (req.body && typeof req.body === 'object') ? req.body : {};
+    let v;
+    if ('traffic' in b) v = b.traffic;
+    else if ('limit' in b) v = b.limit;
+    else if ('dataLimit' in b) v = b.dataLimit;
+    else if (req.query.traffic !== undefined) v = String(req.query.traffic);
+    else return undefined;
+    const n = parseTraffic(v);
+    return n === undefined ? NaN : n;
+}
+
+// Usage: keyObject({ip, publicKey, privateKey, created, rx, tx, hs, paused, limit, over}) -> one key as returned by
+//        /keys and /create?format=json. privateKey/config are null for keys whose private key the server never saw.
 function keyObject(k) {
     const up = k.rx || 0, down = k.tx || 0;
+    const limit = k.limit || 0;
     return {
         id: k.ip,
         name: k.name || '',
@@ -1357,18 +1821,24 @@ function keyObject(k) {
         downloadBytes: down,
         totalBytes: up + down,
         lastHandshake: k.hs ? new Date(k.hs * 1000).toISOString() : null,
+        paused: !!k.paused,
+        dataLimitBytes: limit,                              // 0 = unlimited
+        dataLimit: limit ? { bytes: limit } : null,         // Outline's shape
+        limitReached: !!(limit && k.over),
+        status: k.paused ? 'paused' : (limit && k.over ? 'limit' : 'active'),
         config: k.privateKey ? buildConfig(k.privateKey, k.ip) : null
     };
 }
 
-// Usage: parseKeys(helperOutput) -> [keyObject...] from 'wg-api-helper keys' (7 tab-separated fields per line)
+// Usage: parseKeys(helperOutput) -> [keyObject...] from 'wg-api-helper keys' (11 tab-separated fields per line)
 function parseKeys(text) {
     return text.split('\n').filter(Boolean).map(line => {
         const f = line.split('\t');
         return keyObject({
             ip: f[0], publicKey: f[1], privateKey: f[2] === '-' ? null : f[2],
             created: parseInt(f[3], 10) || 0, rx: parseInt(f[4], 10) || 0,
-            tx: parseInt(f[5], 10) || 0, hs: parseInt(f[6], 10) || 0, name: f[7] || ''
+            tx: parseInt(f[5], 10) || 0, hs: parseInt(f[6], 10) || 0, name: f[7] || '',
+            paused: f[8] === '1', limit: parseInt(f[9], 10) || 0, over: f[10] === '1'
         });
     });
 }
@@ -1381,6 +1851,8 @@ function helperFailure(err, fallback) {
     if (/invalid name/.test(msg)) return { status: 400, error: 'name must be 1-64 characters without control characters' };
     if (/no peer found/.test(msg)) return { status: 404, error: 'no such key' };
     if (/IP pool exhausted/.test(msg)) return { status: 503, error: 'IP pool exhausted' };
+    if (/ip already allocated/.test(msg)) return { status: 409, error: 'ip already in use' };
+    if (/invalid limit/.test(msg)) return { status: 400, error: 'invalid traffic limit' };
     return { status: 500, error: fallback };
 }
 
@@ -1420,22 +1892,36 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Usage: createKey(name) -> keyObject of a new key (first free address, private key kept for GET /keys)
-function createKey(name) {
+// Usage: createKey(name, ip, limit) -> keyObject of a new key at <ip> (or the first free address) with a traffic
+//        limit in bytes (0 = unlimited); the private key is kept for GET /keys
+function createKey(name, ip, limit) {
     const privateKey = execFileSync('wg', ['genkey'], { encoding: 'utf8' }).trim();
     const publicKey = execFileSync('wg', ['pubkey'], { input: privateKey, encoding: 'utf8' }).trim();
-    const clientIP = helper(name ? ['add-auto', publicKey, name] : ['add-auto', publicKey], privateKey + '\n').trim();
+    const clientIP = helper(['add-auto', publicKey, name || '', ip || '', limit ? String(limit) : ''], privateKey + '\n').trim();
     if (!IPV4.test(clientIP)) throw new Error('helper returned an unexpected address');
-    return keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000) });
+    return keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000), limit: limit || 0 });
+}
+
+// Usage: createRequest(req) -> { name, ip, limit } from the body / query, or { error } (400)
+//        {"name": "...", "ipAddress": "10.66.0.2", "traffic": "20G"} - every field optional
+function createRequest(req) {
+    const b = (req.body && typeof req.body === 'object') ? req.body : {};
+    const name = cleanName(b.name || req.query.name);
+    const ipText = b.ipAddress || req.query.ipAddress || '';
+    if (ipText && (typeof ipText !== 'string' || !IPV4.test(ipText.split('/')[0]))) return { error: 'invalid ipAddress format' };
+    const limit = trafficFrom(req);
+    if (Number.isNaN(limit)) return { error: 'invalid traffic: use e.g. "20G", "500M", "1.5T", a number of bytes, or "unlimited"' };
+    return { name, ip: ipText ? ipText.split('/')[0] : '', limit: limit || 0 };
 }
 
 // POST /create            -> client config as text/plain (backward compatible)
 // POST /create?format=json -> the new key as JSON (same shape as one entry of GET /keys)
+//   optional body: {"name": "...", "ipAddress": "10.66.0.2", "traffic": "20G"}
 app.post('/create', (req, res) => {
+    const r = createRequest(req);
+    if (r.error) return res.status(400).json({ error: r.error });
     try {
-        // optional display name: JSON body {"name": "..."} or ?name=...
-        const name = cleanName((req.body && req.body.name) || req.query.name);
-        const key = createKey(name);
+        const key = createKey(r.name, r.ip, r.limit);
         if (req.query.format === 'json') return res.json(key);
         res.type('text/plain').send(key.config);
     } catch (err) {
@@ -1445,10 +1931,12 @@ app.post('/create', (req, res) => {
     }
 });
 
-// POST /access-keys  {"name": "..."}  -> 201 + the new key as JSON (Outline Manager's create call)
+// POST /access-keys  {"name": "...", "ipAddress": "...", "traffic": "20G"}  -> 201 + the new key as JSON
 app.post('/access-keys', (req, res) => {
+    const r = createRequest(req);
+    if (r.error) return res.status(400).json({ error: r.error });
     try {
-        res.status(201).json(createKey(cleanName((req.body && req.body.name) || req.query.name)));
+        res.status(201).json(createKey(r.name, r.ip, r.limit));
     } catch (err) {
         console.error('create failed:', err.message);
         const f = helperFailure(err, 'create failed');
@@ -1531,7 +2019,7 @@ app.get('/usage/:ip', (req, res) => {
 
 // Usage: serverInfo() -> the public facts about this server (no secrets)
 function serverInfo() {
-    return { publicKey: SERVER_PUB, endpoint: ENDPOINT + ':' + WG_PORT, dns: CLIENT_DNS, apiVersion: API_VERSION };
+    return { publicKey: SERVER_PUB, endpoint: ENDPOINT + ':' + WG_PORT, dns: CLIENT_DNS, apiVersion: API_VERSION, features: FEATURES };
 }
 
 // Usage: listKeys(field) -> express handler answering { server, timestamp, count, totals, <field>: [ keyObject ] }
@@ -1619,6 +2107,43 @@ app.put(['/keys/:ip/name', '/access-keys/:ip/name'], (req, res) => {
     }
 });
 
+// Usage: keyAction(res, ip, args) -> runs one helper command on an existing key and answers with the updated key
+function keyAction(res, ipText, args) {
+    const ip = String(ipText || '').split('/')[0];
+    if (!IPV4.test(ip)) return res.status(400).json({ error: 'invalid ip' });
+    try {
+        helper([args[0], ip, ...args.slice(1)]);
+        const keys = parseKeys(helper(['keys', ip]));
+        res.json(keys[0] || { ipAddress: ip });
+    } catch (err) {
+        console.error(args[0] + ' failed:', err.message);
+        const f = helperFailure(err, args[0] + ' failed');
+        res.status(f.status).json({ error: f.error });
+    }
+}
+
+// POST /keys/:ip/pause, /keys/:ip/resume  -> block / unblock all traffic of a key; returns the key
+// PUT  /keys/:ip/paused {"paused": true|false}
+app.post(['/keys/:ip/pause', '/access-keys/:ip/pause'], (req, res) => keyAction(res, req.params.ip, ['pause']));
+app.post(['/keys/:ip/resume', '/access-keys/:ip/resume'], (req, res) => keyAction(res, req.params.ip, ['resume']));
+app.put(['/keys/:ip/paused', '/access-keys/:ip/paused'], (req, res) => {
+    const p = req.body && req.body.paused;
+    if (typeof p !== 'boolean') return res.status(400).json({ error: 'paused must be true or false' });
+    keyAction(res, req.params.ip, [p ? 'pause' : 'resume']);
+});
+
+// PUT /keys/:ip/limit {"traffic": "20G"}   (or "unlimited"; also {"limit": {"bytes": N}} like Outline's data-limit)
+// DELETE /keys/:ip/limit                   -> unlimited
+// The limit counts upload + download since the key was created; a key over it is blocked until it is raised.
+app.put(['/keys/:ip/limit', '/access-keys/:ip/limit', '/access-keys/:ip/data-limit'], (req, res) => {
+    const limit = trafficFrom(req);
+    if (limit === undefined || Number.isNaN(limit)) {
+        return res.status(400).json({ error: 'traffic required: e.g. "20G", "500M", "1.5T", a number of bytes, or "unlimited"' });
+    }
+    keyAction(res, req.params.ip, ['limit', String(limit)]);
+});
+app.delete(['/keys/:ip/limit', '/access-keys/:ip/limit', '/access-keys/:ip/data-limit'], (req, res) => keyAction(res, req.params.ip, ['limit', '0']));
+
 app.listen(__API_PORT__, '127.0.0.1', () => {
     console.log('wg-api listening on 127.0.0.1:__API_PORT__');
 });
@@ -1630,7 +2155,7 @@ SERVER_JS_EOF
         -e "s|__DNS__|${CLIENT_DNS}|g" \
         -e "s|__API_PORT__|${API_PORT_INTERNAL}|g" \
         "${API_DIR}/server.js"
-    chown -R "${API_USER}:${API_USER}" "$API_DIR"
+    api_dir_perms
     if have node; then node --check "${API_DIR}/server.js" || die "server.js has a syntax error."; fi
     ok "${API_DIR}/server.js"
 }
@@ -1654,6 +2179,12 @@ ExecStart=$(command -v node) ${API_DIR}/server.js
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production
+# light hardening: wg-api-helper runs as a child of this service (through sudo) and writes /etc/wireguard and
+# /etc/wg-api, so ProtectSystem/NoNewPrivileges cannot be used here
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
@@ -1830,11 +2361,14 @@ update_api() {
     local d
     d="$(sed -n "s/^const CLIENT_DNS = '\(.*\)';/\1/p" "${API_DIR}/server.js" | head -n1)"
     if [ -n "$d" ]; then CLIENT_DNS="$d"; fi
+    update_firewall
+    step_install_peer_ctrl
     step_generate_token
     step_install_api_helper
     step_install_traffic_saver
+    step_api_npm_setup
     step_write_server_js
-    systemctl restart wg-api || die "wg-api failed to restart: journalctl -u wg-api -n 30"
+    step_create_systemd_service
     sleep 1
     systemctl is-active --quiet wg-api || die "wg-api is not running: journalctl -u wg-api -n 30"
     caddy_add_log_filter
@@ -1849,7 +2383,9 @@ update_api() {
             chmod 600 "$ACCESS_OUTLINE_FILE"
         fi
     fi
-    ok "wg-api updated (API 2.0): GET /keys, Outline-style /access-keys, /server, /metrics/transfer, key names and the secret URL"
+    ok "wg-api updated (API 2.1): pause/resume, traffic limits, create at a chosen address, IPv6 kept in the tunnel"
+    echo "  Client configs now use AllowedIPs = 0.0.0.0/0, ::/0. Devices that imported a key before this update"
+    echo "  keep the old config: re-import it (QR / .conf in the app) to stop IPv6 leaking around the tunnel."
     echo
     echo "  Access config, paste either one into Mithra WireGuard Manager:"
     [ -f "$ACCESS_FILE" ] && echo "    $(jq -c . "$ACCESS_FILE")"
@@ -1903,6 +2439,13 @@ fetch_tool() {
         cp "${SCRIPT_DIR}/${name}" "$tmp"
     elif ! curl -fsSL --retry 3 -m 30 "${REPO_RAW}/${name}" -o "$tmp"; then
         rm -f "$tmp"; warn "Could not download ${name}; run --update-tools later."; return 1
+    else
+        # downloaded: it runs as root (daily timer), so it must be exactly the reviewed version
+        local want="${TOOL_SHA256[$name]:-}" got
+        got="$(sha256sum "$tmp" | awk '{print $1}')"
+        if [ -z "$want" ] || [ "$got" != "$want" ]; then
+            rm -f "$tmp"; warn "${name}: SHA-256 ${got} does not match the expected ${want:-<none>}; not installed."; return 1
+        fi
     fi
     if ! head -n1 "$tmp" | grep -q '^#!' || ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"; warn "${name} failed the syntax check and was not installed."; return 1
@@ -2028,6 +2571,16 @@ print_success_message() {
         echo "  Usage of ONE key (by its IP address):"
         echo "    curl ${tlsopts}${API_URL}/usage/$(sample_ip) -H \"Authorization: Bearer ${API_TOKEN}\""
         echo
+        echo "$sep"
+        echo "  Create a key at a chosen address with a 20 GB traffic limit (or \"unlimited\"):"
+        echo "    curl ${tlsopts}-X POST '${API_URL}/create?format=json' -H \"Authorization: Bearer ${API_TOKEN}\" \\"
+        echo "      -H 'Content-Type: application/json' -d '{\"ipAddress\":\"$(sample_ip)\",\"traffic\":\"20G\"}'"
+        echo "  Change the limit later / remove it:"
+        echo "    curl ${tlsopts}-X PUT ${API_URL}/keys/$(sample_ip)/limit -H \"Authorization: Bearer ${API_TOKEN}\" \\"
+        echo "      -H 'Content-Type: application/json' -d '{\"traffic\":\"50G\"}'      # or {\"traffic\":\"unlimited\"}"
+        echo "  Pause / resume a key:"
+        echo "    curl ${tlsopts}-X POST ${API_URL}/keys/$(sample_ip)/pause -H \"Authorization: Bearer ${API_TOKEN}\"     # .../resume"
+        echo
         echo "  (upload/download are from the client's point of view; totals are kept across restarts and reboots."
         echo "   Polling: one /usage call per minute is fine; prefer it over one call per key.)"
         echo "$sep"
@@ -2044,7 +2597,7 @@ print_success_message() {
   Caddy was skipped. Add this inside the nginx server block for ${DOMAIN}
   (vi /etc/nginx/sites-enabled/<your-site>), then: nginx -t && systemctl reload nginx
 
-    location ~ ^/(create|remove|health)\$ {
+    location / {
         proxy_pass http://127.0.0.1:${API_PORT_INTERNAL};
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-For \$remote_addr;
@@ -2066,7 +2619,7 @@ END
 
 # Usage: install_all -> the full installation, in dependency order
 install_all() {
-    echo "Starting the WireGuard installation..."
+    echo "Starting the WireGuard installation (install-wg-full.sh ${SCRIPT_VERSION})..."
     ask_port
     ask_domain
     ask_https_port
@@ -2079,6 +2632,7 @@ install_all() {
     step_wireguard_keys_config
     step_enable_ip_forward
     step_firewall_ufw
+    step_install_firewall
     step_start_wireguard
     step_install_peer_ctrl
     step_install_monitor
@@ -2137,7 +2691,7 @@ uninstall() {
         mkdir -p "$bk"
         chmod 700 "$bk"
         cp -a /etc/wireguard/. "$bk"/
-        rm -f "$WG_CONFIG" /etc/wireguard/server_private.key /etc/wireguard/server_public.key
+        rm -f "$WG_CONFIG" /etc/wireguard/server_private.key /etc/wireguard/server_public.key "$FW_OPTS" /etc/wireguard/suspended.list
         rmdir /etc/wireguard 2>/dev/null || true
         ok "Backup: $bk"
     fi
@@ -2145,7 +2699,8 @@ uninstall() {
 
     say "[4/7] Removing API, helpers and units..."
     rm -rf "$API_DIR" "$API_ENV_DIR" /var/lib/wg-api
-    rm -f "${BIN_DIR}/wg-api-helper" "${BIN_DIR}/wg-peer-ctrl.sh" "${BIN_DIR}/wg-healthcheck.sh" "${BIN_DIR}/vpn-doctor.sh"
+    [ -x "$FW_SCRIPT" ] && "$FW_SCRIPT" down 2>/dev/null || true
+    rm -f "${BIN_DIR}/wg-api-helper" "${BIN_DIR}/wg-peer-ctrl.sh" "${BIN_DIR}/wg-healthcheck.sh" "${BIN_DIR}/vpn-doctor.sh" "$FW_SCRIPT"
     rm -f "/etc/systemd/system/${API_SERVICE}" /etc/systemd/system/wg-healthcheck.service /etc/systemd/system/wg-healthcheck.timer \
           /etc/systemd/system/wg-traffic.service /etc/systemd/system/wg-traffic.timer /etc/systemd/system/wg-traffic-save.service
     systemctl daemon-reload
@@ -2192,22 +2747,24 @@ uninstall() {
 # Usage: show_menu -> one-shot interactive menu (used when the script is started without arguments)
 show_menu() {
     echo "========================================"
-    echo "   WireGuard Server Installer"
+    echo "   WireGuard Server Installer ${SCRIPT_VERSION}"
     echo "========================================"
     echo "  1) Install WireGuard + HTTPS API + health tools"
     echo "  2) Uninstall"
     echo "  3) Add / repair the wg-monitor account"
     echo "  4) Update health tools (healthcheck, doctor)"
     echo "  5) Change the API HTTPS port / certificate (keeps WireGuard keys and peers)"
+    echo "  6) Update the API and firewall to this version (keeps keys and peers)"
     echo "  0) Exit"
     local choice
-    read -r -p "Choose [0-5]: " choice
+    read -r -p "Choose [0-6]: " choice
     case "$choice" in
         1) install_all ;;
         2) uninstall ;;
         3) ask_monitor_key; step_install_peer_ctrl; step_install_monitor ;;
         4) step_install_peer_ctrl; step_install_tools ;;
         5) reconfigure_api ;;
+        6) update_api ;;
         0) echo "Goodbye." ;;
         *) echo "Invalid choice." ;;
     esac
@@ -2231,6 +2788,7 @@ main() {
         update-tools) step_install_peer_ctrl; step_install_tools ;;
         reconfigure-api) reconfigure_api ;;
         update-api)   update_api ;;
+        update-firewall) update_firewall ;;
         install)
             if [ "$argc" -eq 0 ] && is_tty; then show_menu; else install_all; fi
             ;;
