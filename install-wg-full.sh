@@ -852,12 +852,16 @@ step_install_api_helper() {
 #   wg-api-helper rename <ip> <name>    give a key a display name (1-64 characters, no control characters)
 #   wg-api-helper add <pubkey> <ip>     add a peer to wg0.conf AND the live interface
 #   wg-api-helper remove <ip>           remove a peer from wg0.conf AND the live interface
-#   wg-api-helper usage [<ip>]          traffic counters: one line per peer 'ip<TAB>rx<TAB>tx<TAB>handshake'
+#   wg-api-helper usage [<ip>]          traffic: one line per key 'ip<TAB>rx<TAB>tx<TAB>handshake'
+#   wg-api-helper traffic-save          store the counters in /var/lib/wg-api/traffic.db (timer every minute and
+#                                       just before wg0 stops), so usage survives wg0 restarts and reboots
+# rx/tx everywhere are totals: what was saved before the counters last started from zero, plus the live counters.
 set -euo pipefail
 
 WG_IF="wg0"
 WG_CONF="/etc/wireguard/${WG_IF}.conf"
 CLIENT_DB="/etc/wg-api/clients.db"   # ip<TAB>client pubkey<TAB>client private key or -<TAB>created epoch<TAB>name
+TRAFFIC_DB="/var/lib/wg-api/traffic.db"   # pubkey<TAB>saved rx<TAB>saved tx<TAB>last live rx<TAB>last live tx<TAB>generation
 
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
@@ -961,6 +965,7 @@ cmd_remove() {
     if wg show "$WG_IF" >/dev/null 2>&1; then
         wg set "$WG_IF" peer "$pub" remove || true
     fi
+    traffic_drop "$pub"
     awk -v ip="$ip" '
         function flush() { if (buf != "" && !drop) printf "%s", buf; buf = ""; drop = 0 }
         /^\[/ { flush() }
@@ -974,16 +979,64 @@ cmd_remove() {
     echo "OK: peer removed ($ip)"
 }
 
+# Usage: traffic_gen            -> prints "<boot id>-<wg0 ifindex>"; it changes whenever WireGuard's counters start
+#                                  again from zero (reboot, wg-quick down/up), which is how a reset is recognised
+traffic_gen() {
+    local b i
+    b="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo noboot)"
+    i="$(cat "/sys/class/net/${WG_IF}/ifindex" 2>/dev/null || echo down)"
+    printf '%s-%s' "$b" "$i"
+}
+
+# Usage: traffic_merge totals|save  -> reads $TMPD/dump (wg show dump), traffic.db and wg0.conf
+#        totals: 'pubkey<TAB>total rx<TAB>total tx' for every key in wg0.conf that has traffic
+#        save:   the new traffic.db rows (keys no longer in wg0.conf are dropped)
+#        A key's saved part grows by its last live value when the counters were reset since the last save
+#        (new generation, or a counter smaller than before).
+traffic_merge() {
+    if [ -f "$TRAFFIC_DB" ]; then cp "$TRAFFIC_DB" "$TMPD/traffic"; else : > "$TMPD/traffic"; fi
+    awk -F'\t' -v mode="$1" -v gen="$(traffic_gen)" '
+        FILENAME == ARGV[1] { if (NF >= 6) { brx[$1] = $2; btx[$1] = $3; lrx[$1] = $4; ltx[$1] = $5; g[$1] = $6 }; next }
+        FILENAME == ARGV[2] { if (FNR > 1) { live[$1] = 1; crx[$1] = $6; ctx[$1] = $7 }; next }
+        /^PublicKey[ \t]*=/ { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); conf[v] = 1; next }
+        END {
+            for (p in conf) {
+                if (p in live) {
+                    b_rx = (p in brx) ? brx[p] + 0 : 0; b_tx = (p in btx) ? btx[p] + 0 : 0
+                    if ((p in g) && (g[p] != gen || crx[p] + 0 < lrx[p] + 0 || ctx[p] + 0 < ltx[p] + 0)) {
+                        b_rx += lrx[p]; b_tx += ltx[p]
+                    }
+                    if (mode == "save") printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\n", p, b_rx, b_tx, crx[p], ctx[p], gen
+                    else printf "%s\t%.0f\t%.0f\n", p, b_rx + crx[p], b_tx + ctx[p]
+                } else if (p in brx) {
+                    # wg0 is down (or the peer is not loaded): keep what was saved
+                    if (mode == "save") printf "%s\t%s\t%s\t%s\t%s\t%s\n", p, brx[p], btx[p], lrx[p], ltx[p], g[p]
+                    else printf "%s\t%.0f\t%.0f\n", p, brx[p] + lrx[p], btx[p] + ltx[p]
+                }
+            }
+        }' "$TMPD/traffic" "$TMPD/dump" "$WG_CONF"
+}
+
+# Usage: cmd_traffic_save       -> writes traffic.db atomically (run by wg-traffic.timer and wg-traffic-save.service)
+cmd_traffic_save() {
+    { wg show "$WG_IF" dump 2>/dev/null || true; } > "$TMPD/dump"
+    install -d -o root -g root -m 700 "$(dirname "$TRAFFIC_DB")"
+    traffic_merge save > "$TMPD/traffic.new"
+    install -o root -g root -m 600 "$TMPD/traffic.new" "${TRAFFIC_DB}.new"
+    mv -f "${TRAFFIC_DB}.new" "$TRAFFIC_DB"
+}
+
+# Usage: traffic_drop <pubkey>  -> forgets the saved traffic of a removed key
+traffic_drop() {
+    [ -f "$TRAFFIC_DB" ] || return 0
+    awk -F'\t' -v p="$1" '$1 != p' "$TRAFFIC_DB" > "$TMPD/traffic.drop"
+    install -o root -g root -m 600 "$TMPD/traffic.drop" "${TRAFFIC_DB}.new"
+    mv -f "${TRAFFIC_DB}.new" "$TRAFFIC_DB"
+}
+
 # Usage: cmd_usage [<ip>]       -> 'ip<TAB>bytes_from_client<TAB>bytes_to_client<TAB>last_handshake_epoch' per peer (read-only)
 cmd_usage() {
-    local want="${1:-}"
-    if [ -n "$want" ]; then is_valid_ip "$want" || fail "invalid ip"; fi
-    wg show "$WG_IF" dump 2>/dev/null | awk -F'\t' -v want="$want" '
-        NR == 1 { next }
-        { ip = $4; sub(/\/.*/, "", ip)
-          if (want != "" && ip != want) next
-          printf "%s\t%s\t%s\t%s\n", ip, $6, $7, $5 }
-    ' || true
+    cmd_keys "${1:-}" | awk -F'\t' '{ printf "%s\t%s\t%s\t%s\n", $1, $5, $6, $7 }'
 }
 
 # Usage: db_drop <ip>           -> removes the stored client record of <ip> (if any)
@@ -1050,6 +1103,7 @@ cmd_keys() {
     local want="${1:-}"
     if [ -n "$want" ]; then is_valid_ip "$want" || fail "invalid ip"; fi
     { wg show "$WG_IF" dump 2>/dev/null || true; } > "$TMPD/dump"
+    traffic_merge totals > "$TMPD/totals"
     if [ -f "$CLIENT_DB" ]; then cp "$CLIENT_DB" "$TMPD/db"; else : > "$TMPD/db"; fi
     awk -v want="$want" '
         function flush() {
@@ -1058,19 +1112,20 @@ cmd_keys() {
                 p = mine ? dbpriv[ip] : "-"
                 c = mine ? dbtime[ip] : 0
                 nm = mine ? dbname[ip] : ""
-                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in rx ? rx[pub] : 0), (pub in tx ? tx[pub] : 0), (pub in hs ? hs[pub] : 0), nm
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in trx ? trx[pub] : 0), (pub in ttx ? ttx[pub] : 0), (pub in hs ? hs[pub] : 0), nm
             }
             pub = ""; ip = ""
         }
         FILENAME == ARGV[1] { split($0, f, "\t"); dbpub[f[1]] = f[2]; dbpriv[f[1]] = f[3]; dbtime[f[1]] = f[4]; dbname[f[1]] = f[5]; next }
-        FILENAME == ARGV[2] { split($0, f, "\t"); if (FNR > 1) { hs[f[1]] = f[5]; rx[f[1]] = f[6]; tx[f[1]] = f[7] }; next }
+        FILENAME == ARGV[2] { split($0, f, "\t"); if (FNR > 1) { hs[f[1]] = f[5] }; next }
+        FILENAME == ARGV[3] { split($0, f, "\t"); trx[f[1]] = f[2]; ttx[f[1]] = f[3]; next }
         /^\[/ { flush(); next }
         /^PublicKey[ \t]*=/  { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); pub = v; next }
         /^AllowedIPs[ \t]*=/ { v = $0; sub(/^AllowedIPs[ \t]*=[ \t]*/, "", v); n = split(v, a, /[ \t]*,[ \t]*/)
                                for (i = 1; i <= n; i++) if (a[i] ~ /\/32$/) { sub(/\/32$/, "", a[i]); ip = a[i]; break }
                                next }
         END { flush() }
-    ' "$TMPD/db" "$TMPD/dump" "$WG_CONF"
+    ' "$TMPD/db" "$TMPD/dump" "$TMPD/totals" "$WG_CONF"
 }
 
 exec 9>/run/wg-api-helper.lock
@@ -1085,6 +1140,7 @@ case "${1:-}" in
     keys)     [ "$#" -le 2 ] || fail "usage: keys [<ip>]";        cmd_keys "${2:-}" ;;
     remove)   [ "$#" -eq 2 ] || fail "usage: remove <ip>";        cmd_remove "$2" ;;
     usage)    [ "$#" -le 2 ] || fail "usage: usage [<ip>]";       cmd_usage "${2:-}" ;;
+    traffic-save) [ "$#" -eq 1 ] || fail "usage: traffic-save";   cmd_traffic_save ;;
     *)        fail "command not permitted: ${1:-<empty>}" ;;
 esac
 WG_API_HELPER_EOF
@@ -1092,6 +1148,56 @@ WG_API_HELPER_EOF
     chmod 755 "${BIN_DIR}/wg-api-helper"
     bash -n "${BIN_DIR}/wg-api-helper" || die "wg-api-helper failed its syntax check."
     ok "${BIN_DIR}/wg-api-helper"
+}
+
+# Usage: step_install_traffic_saver -> timer that saves the traffic counters every minute, plus a unit that saves them
+#        once more right before wg0 stops (shutdown, reboot, systemctl restart wg-quick@wg0), so usage survives restarts
+step_install_traffic_saver() {
+    [ "$INSTALL_API" -eq 1 ] || return 0
+    [ -x "${BIN_DIR}/wg-api-helper" ] || return 0
+    say "Installing the traffic saver (usage survives restarts)..."
+    cat > /etc/systemd/system/wg-traffic.service <<END
+[Unit]
+Description=Save WireGuard traffic counters (persistent usage)
+After=wg-quick@${WG_INTERFACE}.service
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_DIR}/wg-api-helper traffic-save
+END
+    cat > /etc/systemd/system/wg-traffic.timer <<END
+[Unit]
+Description=Save WireGuard traffic counters every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+END
+    # After= makes this unit stop BEFORE wg-quick stops (stop order is the reverse of start order), and PartOf= makes a
+    # restart of wg-quick@wg0 restart this unit too: ExecStop saves the counters while wg0 still has them
+    cat > /etc/systemd/system/wg-traffic-save.service <<END
+[Unit]
+Description=Save WireGuard traffic counters before ${WG_INTERFACE} goes down
+After=wg-quick@${WG_INTERFACE}.service
+PartOf=wg-quick@${WG_INTERFACE}.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${BIN_DIR}/wg-api-helper traffic-save
+ExecStop=${BIN_DIR}/wg-api-helper traffic-save
+
+[Install]
+WantedBy=multi-user.target wg-quick@${WG_INTERFACE}.service
+END
+    systemctl daemon-reload
+    systemctl enable --now wg-traffic.timer >/dev/null 2>&1 || warn "Could not enable wg-traffic.timer"
+    systemctl enable --now wg-traffic-save.service >/dev/null 2>&1 || warn "Could not enable wg-traffic-save.service"
+    ok "Usage is saved every minute and before ${WG_INTERFACE} stops (/var/lib/wg-api/traffic.db)"
 }
 
 # Usage: step_create_api_user -> non-root API user plus its sudoers entry (only wg-api-helper)
@@ -1390,7 +1496,7 @@ function parseUsage(text) {
 
 // GET /usage        -> { interface, timestamp, totals, keys: [ per-key usage ] }
 // GET /usage/:ip    -> usage of one key, e.g. /usage/10.66.0.5
-// Counters come from the kernel and reset when wg0 restarts or the server reboots.
+// Totals: saved every minute and just before wg0 stops, so they survive wg0 restarts and reboots (traffic.db).
 app.get('/usage', (req, res) => {
     try {
         const keys = parseUsage(helper(['usage']));
@@ -1726,6 +1832,7 @@ update_api() {
     if [ -n "$d" ]; then CLIENT_DNS="$d"; fi
     step_generate_token
     step_install_api_helper
+    step_install_traffic_saver
     step_write_server_js
     systemctl restart wg-api || die "wg-api failed to restart: journalctl -u wg-api -n 30"
     sleep 1
@@ -1921,7 +2028,7 @@ print_success_message() {
         echo "  Usage of ONE key (by its IP address):"
         echo "    curl ${tlsopts}${API_URL}/usage/$(sample_ip) -H \"Authorization: Bearer ${API_TOKEN}\""
         echo
-        echo "  (upload/download are from the client's point of view; counters reset when wg0 or the server restarts."
+        echo "  (upload/download are from the client's point of view; totals are kept across restarts and reboots."
         echo "   Polling: one /usage call per minute is fine; prefer it over one call per key.)"
         echo "$sep"
         if [ -n "$tlsopts" ]; then
@@ -1976,6 +2083,7 @@ install_all() {
     step_install_peer_ctrl
     step_install_monitor
     step_install_api_helper
+    step_install_traffic_saver
     step_create_api_user
     step_api_npm_setup
     step_generate_token
@@ -2006,7 +2114,8 @@ uninstall() {
 
     say "[1/7] Stopping services..."
     local svc
-    for svc in wg-healthcheck.timer wg-healthcheck.service "$API_SERVICE" "wg-quick@${WG_INTERFACE}"; do
+    for svc in wg-healthcheck.timer wg-healthcheck.service wg-traffic.timer wg-traffic.service wg-traffic-save.service \
+               "$API_SERVICE" "wg-quick@${WG_INTERFACE}"; do
         systemctl disable --now "$svc" >/dev/null 2>&1 || true
     done
 
@@ -2035,9 +2144,10 @@ uninstall() {
     rm -f /etc/sysctl.d/99-wireguard.conf
 
     say "[4/7] Removing API, helpers and units..."
-    rm -rf "$API_DIR" "$API_ENV_DIR"
+    rm -rf "$API_DIR" "$API_ENV_DIR" /var/lib/wg-api
     rm -f "${BIN_DIR}/wg-api-helper" "${BIN_DIR}/wg-peer-ctrl.sh" "${BIN_DIR}/wg-healthcheck.sh" "${BIN_DIR}/vpn-doctor.sh"
-    rm -f "/etc/systemd/system/${API_SERVICE}" /etc/systemd/system/wg-healthcheck.service /etc/systemd/system/wg-healthcheck.timer
+    rm -f "/etc/systemd/system/${API_SERVICE}" /etc/systemd/system/wg-healthcheck.service /etc/systemd/system/wg-healthcheck.timer \
+          /etc/systemd/system/wg-traffic.service /etc/systemd/system/wg-traffic.timer /etc/systemd/system/wg-traffic-save.service
     systemctl daemon-reload
 
     say "[5/7] Removing sudoers entries and accounts..."
