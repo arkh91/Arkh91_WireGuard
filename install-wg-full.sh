@@ -8,7 +8,13 @@
 #     (survive reboots) and ip_forward persisted in /etc/sysctl.d
 #   - wg-api  (Node.js, localhost only) behind Caddy on an HTTPS port YOU choose
 #     (the installer scans for free ports) with a Bearer token:
-#     POST /create, POST /remove, GET /keys[/<ip>], GET /usage[/<ip>], GET /health.
+#     POST /create, POST /remove, GET /keys[/<ip>], GET /usage[/<ip>], GET /health,
+#     plus Outline-style routes: GET/POST /access-keys, DELETE /access-keys/<ip>,
+#     PUT /access-keys/<ip>/name, GET /server, GET /metrics/transfer.
+#     Access config in two formats (Mithra WireGuard Manager takes either):
+#       {"apiUrl":"https://host:port","apiToken":"...","certSha256":"..."}
+#       {"apiUrl":"https://host:port/<secret>","certSha256":"..."}   (exactly Outline's format:
+#        GET <apiUrl>/access-keys returns every key, no header needed)
 #     Nothing listens on port 80.
 #   - /usr/local/bin/wg-peer-ctrl.sh   restricted dispatcher (suspend, limits...)
 #   - /usr/local/bin/wg-healthcheck.sh health check  (from the repo)
@@ -82,7 +88,9 @@ MONITOR_MARK="# wg-monitor (install-wg-full.sh)"
 
 BIN_DIR="/usr/local/bin"
 REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
+# BASH_SOURCE is empty when the script is piped (curl ... | sudo bash -s -- ...), and set -u would stop on it
+SELF="${BASH_SOURCE[0]:-}"
+SCRIPT_DIR="$( [ -n "$SELF" ] && cd "$(dirname "$SELF")" 2>/dev/null && pwd || echo . )"
 
 DOMAIN=""
 HTTPS_PORT=""
@@ -132,7 +140,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 is_tty() { [ -t 0 ]; }
 
 # Usage: show_help       -> prints the header comment as help text
-show_help() { awk 'NR==2{next} /^# =+$/{exit} {print}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+show_help() {
+    if [ -n "$SELF" ] && [ -r "$SELF" ]; then
+        awk 'NR==2{next} /^# =+$/{exit} {print}' "$SELF" | sed 's/^# \{0,1\}//'
+    else
+        echo "Download the script first to read its help:  curl -LO $REPO_RAW/install-wg-full.sh && bash install-wg-full.sh --help"
+    fi
+}
 
 # ----------------------------- checks and arguments ---------------------------
 
@@ -1174,7 +1188,11 @@ const SERVER_PUB = '__SERVER_PUB__';
 const ENDPOINT = '__ENDPOINT__';
 const WG_PORT = __WG_PORT__;
 const CLIENT_DNS = '__DNS__';
-const HELPER = '/usr/local/bin/wg-api-helper';
+// WG_API_HELPER: test override only; in production sudoers allows nothing but the real path
+const HELPER = process.env.WG_API_HELPER || '/usr/local/bin/wg-api-helper';
+// reported by GET /server; Mithra WireGuard Manager uses it to know which routes exist
+const API_VERSION = '2.0';
+const STARTED_MS = Date.now();
 
 // Usage: sameSecret(a, b) -> true if two strings are equal (constant time)
 function sameSecret(a, b) {
@@ -1291,22 +1309,29 @@ app.use((req, res, next) => {
     next();
 });
 
+// /health again behind the secret path, so <apiUrl>/health works with an Outline-style apiUrl too
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Usage: createKey(name) -> keyObject of a new key (first free address, private key kept for GET /keys)
+function createKey(name) {
+    const privateKey = execFileSync('wg', ['genkey'], { encoding: 'utf8' }).trim();
+    const publicKey = execFileSync('wg', ['pubkey'], { input: privateKey, encoding: 'utf8' }).trim();
+    const clientIP = helper(name ? ['add-auto', publicKey, name] : ['add-auto', publicKey], privateKey + '\n').trim();
+    if (!IPV4.test(clientIP)) throw new Error('helper returned an unexpected address');
+    return keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000) });
+}
+
 // POST /create            -> client config as text/plain (backward compatible)
-// POST /create?format=json -> { address, publicKey, privateKey, config }
+// POST /create?format=json -> the new key as JSON (same shape as one entry of GET /keys)
 app.post('/create', (req, res) => {
     try {
-        const privateKey = execFileSync('wg', ['genkey'], { encoding: 'utf8' }).trim();
-        const publicKey = execFileSync('wg', ['pubkey'], { input: privateKey, encoding: 'utf8' }).trim();
         // optional display name: JSON body {"name": "..."} or ?name=...
         const name = cleanName((req.body && req.body.name) || req.query.name);
-        // the helper picks the first free address under its lock and keeps the private key for GET /keys
-        const clientIP = helper(name ? ['add-auto', publicKey, name] : ['add-auto', publicKey], privateKey + '\n').trim();
-        if (!IPV4.test(clientIP)) throw new Error('helper returned an unexpected address');
-
-        if (req.query.format === 'json') {
-            return res.json(keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000) }));
-        }
-        res.type('text/plain').send(buildConfig(privateKey, clientIP));
+        const key = createKey(name);
+        if (req.query.format === 'json') return res.json(key);
+        res.type('text/plain').send(key.config);
     } catch (err) {
         console.error('create failed:', err.message);
         const f = helperFailure(err, 'create failed');
@@ -1314,25 +1339,38 @@ app.post('/create', (req, res) => {
     }
 });
 
-// POST /remove  { "ipAddress": "10.66.0.5" }
-app.post('/remove', (req, res) => {
-    const ipAddress = req.body && req.body.ipAddress;
-    if (typeof ipAddress !== 'string' || !ipAddress) {
-        return res.status(400).json({ error: 'ipAddress required' });
+// POST /access-keys  {"name": "..."}  -> 201 + the new key as JSON (Outline Manager's create call)
+app.post('/access-keys', (req, res) => {
+    try {
+        res.status(201).json(createKey(cleanName((req.body && req.body.name) || req.query.name)));
+    } catch (err) {
+        console.error('create failed:', err.message);
+        const f = helperFailure(err, 'create failed');
+        res.status(f.status).json({ error: f.error });
     }
-    const ipOnly = ipAddress.split('/')[0];
-    if (!IPV4.test(ipOnly)) {
-        return res.status(400).json({ error: 'invalid ipAddress format' });
-    }
+});
+
+// Usage: removeKey(ipText, res, okStatus) -> validates, removes through the helper and answers the request
+function removeKey(ipText, res, okStatus) {
+    if (typeof ipText !== 'string' || !ipText) return res.status(400).json({ error: 'ipAddress required' });
+    const ipOnly = ipText.split('/')[0];
+    if (!IPV4.test(ipOnly)) return res.status(400).json({ error: 'invalid ipAddress format' });
     try {
         helper(['remove', ipOnly]);
+        if (okStatus === 204) return res.status(204).end();
         res.json({ success: true, removed: ipOnly });
     } catch (err) {
         console.error('remove failed:', err.message);
         const f = helperFailure(err, 'remove failed');
         res.status(f.status).json({ error: f.error });
     }
-});
+}
+
+// POST /remove  { "ipAddress": "10.66.0.5" }
+app.post('/remove', (req, res) => removeKey(req.body && req.body.ipAddress, res, 200));
+
+// DELETE /access-keys/10.66.0.5 (Outline Manager's delete call; also /keys/10.66.0.5) -> 204
+app.delete(['/access-keys/:ip', '/keys/:ip'], (req, res) => removeKey(req.params.ip, res, 204));
 
 // Usage: parseUsage(text) -> [{ ipAddress, uploadBytes, downloadBytes, lastHandshake }]
 // "upload" and "download" are from the client's point of view (server rx = client upload).
@@ -1385,30 +1423,59 @@ app.get('/usage/:ip', (req, res) => {
     }
 });
 
-// GET /keys       -> every key on the server with its full client settings and usage (like Outline's access keys):
-//                    { server, count, totals, keys: [ keyObject ] }
-//                    Also answered at the apiUrl itself (GET /) and at /access-keys (Outline's path), so a
-//                    manager holding only the access config {apiUrl, apiToken, certSha256} gets every key
-//                    with one GET of apiUrl.
-// GET /keys/:ip   -> one key, e.g. /keys/10.66.0.5
-app.get(['/', '/keys', '/access-keys'], (req, res) => {
+// Usage: serverInfo() -> the public facts about this server (no secrets)
+function serverInfo() {
+    return { publicKey: SERVER_PUB, endpoint: ENDPOINT + ':' + WG_PORT, dns: CLIENT_DNS, apiVersion: API_VERSION };
+}
+
+// Usage: listKeys(field) -> express handler answering { server, timestamp, count, totals, <field>: [ keyObject ] }
+function listKeys(field) {
+    return (req, res) => {
+        try {
+            const keys = parseKeys(helper(['keys']));
+            const totals = keys.reduce((t, k) => ({
+                uploadBytes: t.uploadBytes + k.uploadBytes,
+                downloadBytes: t.downloadBytes + k.downloadBytes,
+                totalBytes: t.totalBytes + k.totalBytes
+            }), { uploadBytes: 0, downloadBytes: 0, totalBytes: 0 });
+            res.json({ server: serverInfo(), timestamp: new Date().toISOString(), count: keys.length, totals, [field]: keys });
+        } catch (err) {
+            console.error('keys failed:', err.message);
+            const f = helperFailure(err, 'keys failed');
+            res.status(f.status).json({ error: f.error });
+        }
+    };
+}
+
+// GET /keys        -> every key with its full client settings and usage: { server, count, totals, keys: [...] }
+//                     also at the apiUrl itself (GET /), so one GET of apiUrl returns every key
+// GET /access-keys -> the same list under "accessKeys", the name Outline uses: with the Outline-style
+//                     access config, GET <apiUrl>/access-keys needs no header at all
+// GET /keys/:ip    -> one key, e.g. /keys/10.66.0.5
+app.get(['/', '/keys'], listKeys('keys'));
+app.get('/access-keys', listKeys('accessKeys'));
+
+// GET /server -> { name, serverId, publicKey, endpoint, dns, apiVersion, accessKeyCount, ... } (like Outline's /server)
+app.get('/server', (req, res) => {
     try {
-        const keys = parseKeys(helper(['keys']));
-        const totals = keys.reduce((t, k) => ({
-            uploadBytes: t.uploadBytes + k.uploadBytes,
-            downloadBytes: t.downloadBytes + k.downloadBytes,
-            totalBytes: t.totalBytes + k.totalBytes
-        }), { uploadBytes: 0, downloadBytes: 0, totalBytes: 0 });
-        res.json({
-            server: { publicKey: SERVER_PUB, endpoint: ENDPOINT + ':' + WG_PORT, dns: CLIENT_DNS },
-            timestamp: new Date().toISOString(),
-            count: keys.length,
-            totals,
-            keys
-        });
+        const count = helper(['used-ips']).split('\n').filter(Boolean).length;
+        res.json(Object.assign({ name: ENDPOINT, serverId: SERVER_PUB, createdTimestampMs: STARTED_MS,
+            accessKeyCount: count, portForNewAccessKeys: WG_PORT }, serverInfo()));
     } catch (err) {
-        console.error('keys failed:', err.message);
-        const f = helperFailure(err, 'keys failed');
+        console.error('server failed:', err.message);
+        res.status(500).json({ error: 'server info failed' });
+    }
+});
+
+// GET /metrics/transfer -> { bytesTransferredByUserId: { "10.66.0.2": 12345, ... } } (Outline's usage call)
+app.get('/metrics/transfer', (req, res) => {
+    try {
+        const out = {};
+        for (const k of parseUsage(helper(['usage']))) out[k.ipAddress] = k.totalBytes;
+        res.json({ bytesTransferredByUserId: out });
+    } catch (err) {
+        console.error('metrics failed:', err.message);
+        const f = helperFailure(err, 'metrics failed');
         res.status(f.status).json({ error: f.error });
     }
 });
@@ -1674,7 +1741,7 @@ update_api() {
             chmod 600 "$ACCESS_OUTLINE_FILE"
         fi
     fi
-    ok "wg-api updated: GET /keys, key names, /usage and the Outline-style secret URL are available"
+    ok "wg-api updated (API 2.0): GET /keys, Outline-style /access-keys, /server, /metrics/transfer, key names and the secret URL"
     echo
     echo "  Access config, paste either one into Mithra WireGuard Manager:"
     [ -f "$ACCESS_FILE" ] && echo "    $(jq -c . "$ACCESS_FILE")"
