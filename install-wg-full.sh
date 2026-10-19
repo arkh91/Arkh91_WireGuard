@@ -12,7 +12,8 @@
 #     plus Outline-style routes: GET/POST /access-keys, DELETE /access-keys/<ip>,
 #     PUT /access-keys/<ip>/name, GET /server, GET /metrics/transfer,
 #     pause/resume a key (POST /keys/<ip>/pause, /resume) and a traffic limit per key
-#     (PUT /keys/<ip>/limit {"traffic":"20G"} or "unlimited"; also at create time).
+#     (PUT /keys/<ip>/limit {"traffic":"20G"} or "unlimited"; also at create time), and a time limit per key
+#     (PUT /keys/<ip>/expiry {"expires":"30d"} from now, or {"expiresAfterFirstConnection":"1m"}).
 #     Access config in two formats (Mithra WireGuard Manager takes either):
 #       {"apiUrl":"https://host:port","apiToken":"...","certSha256":"..."}
 #       {"apiUrl":"https://host:port/<secret>","certSha256":"..."}   (exactly Outline's format:
@@ -104,7 +105,7 @@ MONITOR_KEY_FILE=""
 MONITOR_MARK="# wg-monitor (install-wg-full.sh)"
 
 BIN_DIR="/usr/local/bin"
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.2.0"
 # the health tools are fetched from this exact commit and must match these hashes (update both together)
 REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/1764dec2a35b2f054217496e9e3ea929ebb59fe0"
 declare -A TOOL_SHA256=(
@@ -605,7 +606,7 @@ step_install_firewall() {
 #   wg-firewall.sh status         print the rules
 #
 # FORWARD gets one block at the top, always in this order, so a suspension can never be bypassed:
-#   1  -j WG-SUSPEND                              paused keys, keys over their traffic limit, wg-peer-ctrl suspensions
+#   1  -j WG-SUSPEND                              paused, over-limit and expired keys, wg-peer-ctrl suspensions
 #   2  -i wg0 -j WG-GUARD                         no client-to-client, no private / metadata networks
 #   3  -i wg0 -j ACCEPT
 #   4  -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
@@ -613,7 +614,7 @@ step_install_firewall() {
 # INPUT gets: udp/<port> ACCEPT, then -i wg0 -j WG-IN (clients may not reach the server's own services).
 # The NAT (MASQUERADE) rule stays in wg0.conf's own PostUp/PostDown lines.
 # The suspend state lives in files, so it survives restarts and reboots without netfilter-persistent:
-#   /etc/wg-api/policy.db          ip<TAB>pubkey<TAB>paused<TAB>limit bytes<TAB>over limit   (wg-api-helper)
+#   /etc/wg-api/policy.db          ip<TAB>pubkey<TAB>paused<TAB>limit bytes<TAB>over limit<TAB>...<TAB>expired (wg-api-helper)
 #   /etc/wireguard/suspended.list  one CIDR per line                                         (wg-peer-ctrl.sh)
 set -euo pipefail
 
@@ -675,7 +676,8 @@ valid_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2])
 # Usage: blocked_cidrs -> every address that must be dropped right now (paused, over limit, suspended)
 blocked_cidrs() {
     if [ -r "$POLICY_DB" ]; then
-        awk -F'\t' '($3 == "1" || $5 == "1") { print $1 "/32" }' "$POLICY_DB"
+        # paused, over the traffic limit, or past the end of its time limit
+        awk -F'\t' '($3 == "1" || $5 == "1" || $9 == "1") { print $1 "/32" }' "$POLICY_DB"
     fi
     if [ -r "$SUSPEND_LIST" ]; then
         grep -vE '^[[:space:]]*(#|$)' "$SUSPEND_LIST" || true
@@ -1165,7 +1167,7 @@ step_install_api_helper() {
 # wg-api-helper - root-owned helper for wg-api. Called through sudo; it is the
 # only thing the API user may run as root and it accepts only these commands:
 #   wg-api-helper used-ips              every client address already in wg0.conf
-#   wg-api-helper add-auto <pubkey> [<name>] [<ip>] [<limit bytes>]
+#   wg-api-helper add-auto <pubkey> [<name>] [<ip>] [<limit bytes>] [<expiry>]
 #                                       add the peer at <ip> (or the first free address), print the address
 #                                       (the client's private key may be given on stdin; it is kept in
 #                                        /etc/wg-api/clients.db, root only, so GET /keys can show the config again)
@@ -1173,6 +1175,9 @@ step_install_api_helper() {
 #                                       paused (0/1), traffic limit in bytes (0 = unlimited), over the limit (0/1)
 #   wg-api-helper pause <ip>            block all traffic of a key (it stays configured; resume undoes it)
 #   wg-api-helper resume <ip>           lift a pause
+#   wg-api-helper expiry <ip> <spec>    time limit of a key: 0 (none), at:<epoch>, in:<n>h|d|w|m (from now) or
+#                                       after:<n>h|d|w|m (from its first connection; m = calendar months). A key past its
+#                                       end is blocked like a paused one until it gets a later end (or none).
 #   wg-api-helper limit <ip> <bytes>    traffic limit of a key, upload + download since it was created; 0 = unlimited.
 #                                       A key over its limit is blocked like a paused one (checked now and every
 #                                       minute by traffic-save) and unblocked when the limit is raised or removed.
@@ -1190,6 +1195,8 @@ WG_CONF="/etc/wireguard/${WG_IF}.conf"
 CLIENT_DB="/etc/wg-api/clients.db"   # ip<TAB>client pubkey<TAB>client private key or -<TAB>created epoch<TAB>name
 TRAFFIC_DB="/var/lib/wg-api/traffic.db"   # pubkey<TAB>saved rx<TAB>saved tx<TAB>last live rx<TAB>last live tx<TAB>generation<TAB>last handshake
 POLICY_DB="/etc/wg-api/policy.db"   # ip<TAB>pubkey<TAB>paused 0/1<TAB>limit bytes (0 = unlimited)<TAB>over the limit 0/1
+                                    # <TAB>ends at (epoch, 0 = no end yet)<TAB>duration after first connection (e.g. 30d, 1m)
+                                    # <TAB>first connection (epoch, 0 = not yet)<TAB>expired 0/1
 FW="/usr/local/bin/wg-firewall.sh"
 
 TMPD="$(mktemp -d)"
@@ -1362,12 +1369,13 @@ cmd_traffic_save() {
 # Usage: load_dump              -> writes the live 'wg show dump' to $TMPD/dump (empty when wg0 is down)
 load_dump() { { wg show "$WG_IF" dump 2>/dev/null || true; } > "$TMPD/dump"; }
 
-# Usage: pol_write <file>       -> atomically replaces policy.db with <file> (rows of keys no longer in wg0.conf dropped)
+# Usage: pol_write <file>       -> atomically replaces policy.db with <file> (rows of keys no longer in wg0.conf dropped,
+#                                  and rows with nothing set)
 pol_write() {
     install -d -o root -g root -m 700 "$(dirname "$POLICY_DB")"
     awk -F'\t' '
         FILENAME == ARGV[1] { if ($0 ~ /^PublicKey[ \t]*=/) { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); conf[v] = 1 }; next }
-        ($2 in conf) && ($3 == "1" || $4 + 0 > 0)
+        ($2 in conf) && ($3 == "1" || $4 + 0 > 0 || $6 + 0 > 0 || $7 != "")
     ' "$WG_CONF" "$1" > "$TMPD/policy.clean"
     install -o root -g root -m 600 "$TMPD/policy.clean" "${POLICY_DB}.new"
     mv -f "${POLICY_DB}.new" "$POLICY_DB"
@@ -1378,35 +1386,116 @@ fw_sync() {
     if [ -x "$FW" ]; then "$FW" sync-suspend || fail "could not update the firewall (wg-firewall.sh sync-suspend)"; fi
 }
 
-# Usage: pol_set <ip> <pubkey> <paused|-> <limit|->  -> changes one key's policy ('-' keeps the current value),
-#                                  works out "over the limit" from the saved + live traffic, applies the firewall
+# Usage: valid_duration <spec>  -> 0 for <n>h, <n>d, <n>w or <n>m (hours, days, weeks, calendar months), n = 1..9999
+valid_duration() { [[ "$1" =~ ^[1-9][0-9]{0,3}[hdwm]$ ]]; }
+
+# Usage: add_duration <epoch> <spec> -> prints <epoch> + <spec>. Months are calendar months in UTC, kept inside the
+#        target month: Jan 15 + 1m = Feb 15, Jan 31 + 1m = Feb 28 (or 29).
+add_duration() {
+    local n="${2%?}" u="${2: -1}" y mo d hms t last
+    case "$u" in
+        h) echo $(( $1 + n * 3600 )) ;;
+        d) echo $(( $1 + n * 86400 )) ;;
+        w) echo $(( $1 + n * 604800 )) ;;
+        m)
+            read -r y mo d hms <<<"$(date -u -d "@$1" '+%Y %m %d %H:%M:%S')"
+            t=$(( 10#$mo - 1 + n )); y=$(( 10#$y + t / 12 )); mo=$(( t % 12 + 1 ))
+            # last day of the target month: day 1 of the next month minus one day ("UTC" before any '+': GNU date
+            # would otherwise read "+ 1" as a time zone)
+            last="$(date -u -d "$(printf '%04d-%02d-01' "$y" "$mo") 12:00:00 UTC + 1 month - 1 day" +%d)"
+            [ "$(( 10#$d ))" -gt "$(( 10#$last ))" ] && d="$last"
+            date -u -d "$(printf '%04d-%02d-%02d' "$y" "$mo" "$(( 10#$d ))") ${hms} UTC" +%s ;;
+    esac
+}
+
+# Usage: valid_expiry <spec>    -> 0 for: 0 (no time limit) | at:<epoch> | in:<duration> | after:<duration>
+valid_expiry() {
+    case "$1" in
+        0) return 0 ;;
+        at:*) [[ "${1#at:}" =~ ^[1-9][0-9]{8,10}$ ]] ;;
+        in:*) valid_duration "${1#in:}" ;;
+        after:*) valid_duration "${1#after:}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Usage: pol_calc <in> <out>    -> recomputes every row of a policy file from the traffic totals ($TMPD/totals) and the clock:
+#        over the traffic limit; for "after first connection" keys that connected since the last check, the start (their
+#        handshake) and the end; expired. Row: ip pub paused limit over expires duration first_connected expired
+pol_calc() {
+    local now line ip pub pa li ov ex du first ed
+    now="$(date +%s)"
+    awk -F'\t' -v OFS='\t' -v now="$now" '
+        FILENAME == ARGV[1] { tot[$1] = $2 + $3; hs[$1] = $4 + 0; next }
+        {
+            ex = $6 + 0; du = $7; fi = $8 + 0
+            over = ($4 + 0 > 0 && (tot[$2] + 0) >= $4 + 0) ? 1 : 0
+            if (du != "" && fi == 0 && hs[$2] > 0) { fi = hs[$2]; ex = "ADD" }
+            expd = (ex != "ADD" && ex > 0 && now + 0 >= ex) ? 1 : 0
+            print $1, $2, $3 + 0, $4 + 0, over, ex, du, fi, expd
+        }' "$TMPD/totals" "$1" > "$2.tmp"
+    if grep -q $'\tADD\t' "$2.tmp"; then
+        # a key just made its first connection: its end is first connection + duration (months need date(1))
+        : > "$2"
+        while IFS= read -r line; do
+            IFS=$'\t' read -r ip pub pa li ov ex du first ed <<<"$line"
+            if [ "$ex" = "ADD" ]; then
+                ex="$(add_duration "$first" "$du")"
+                ed=0; [ "$now" -ge "$ex" ] && ed=1
+                logger -t wg-api-helper "result=OK action=first-connection ip=${ip} ends=${ex}"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ip" "$pub" "$pa" "$li" "$ov" "$ex" "$du" "$first" "$ed" >> "$2"
+            else
+                printf '%s\n' "$line" >> "$2"
+            fi
+        done < "$2.tmp"
+        rm -f "$2.tmp"
+    else
+        mv -f "$2.tmp" "$2"
+    fi
+}
+
+# Usage: pol_set <ip> <pubkey> <paused|-> <limit|-> [<expiry|->]  -> changes one key's policy ('-' keeps the current
+#        value), recomputes it (pol_calc) and applies the firewall. <expiry>: see valid_expiry; "in:<d>" is turned into
+#        "at:<now + d>", "after:<d>" waits for the key's first connection (a key that has connected before starts now)
 pol_set() {
-    local ip="$1" pub="$2" paused="$3" limit="$4"
+    local ip="$1" pub="$2" paused="$3" limit="$4" exp="${5:--}" ex="-" du="-" first=0 now hs
+    now="$(date +%s)"
     [ -f "$POLICY_DB" ] && cp "$POLICY_DB" "$TMPD/policy" || : > "$TMPD/policy"
     load_dump
     traffic_merge totals > "$TMPD/totals"
-    awk -F'\t' -v OFS='\t' -v ip="$ip" -v pub="$pub" -v paused="$paused" -v limit="$limit" '
-        FILENAME == ARGV[1] { tot[$1] = $2 + $3; next }
-        $1 == ip { op = $3; ol = $4; next }
+    case "$exp" in
+        -) ;;
+        0) ex=0; du="" ;;
+        at:*) ex="${exp#at:}"; du="" ;;
+        in:*) ex="$(add_duration "$now" "${exp#in:}")"; du="" ;;
+        after:*)
+            du="${exp#after:}"; ex=0
+            # a key that has connected before starts counting now (not at an old handshake)
+            hs="$(awk -F'\t' -v p="$pub" '$1 == p { print $4 + 0; exit }' "$TMPD/totals")"
+            if [ "${hs:-0}" -gt 0 ]; then first="$now"; ex="$(add_duration "$now" "$du")"; fi ;;
+    esac
+    awk -F'\t' -v OFS='\t' -v ip="$ip" -v pub="$pub" -v paused="$paused" -v limit="$limit" -v ex="$ex" -v du="$du" \
+        -v first="$first" '
+        $1 == ip { op = $3; ol = $4; oe = $6; od = $7; of = $8; next }
         { print }
         END {
-            p = (paused == "-") ? (op == "" ? 0 : op) : paused
-            l = (limit == "-") ? (ol == "" ? 0 : ol) : limit
-            over = (l + 0 > 0 && (tot[pub] + 0) >= l + 0) ? 1 : 0
-            print ip, pub, p, l, over
-        }' "$TMPD/totals" "$TMPD/policy" > "$TMPD/policy.new"
+            p = (paused == "-") ? op + 0 : paused
+            l = (limit == "-") ? ol + 0 : limit
+            if (ex == "-") { e = oe + 0; d = od; f = of + 0 } else { e = ex; d = du; f = first + 0 }
+            print ip, pub, p, l, 0, e, d, f, 0
+        }' "$TMPD/policy" > "$TMPD/policy.set"
+    pol_calc "$TMPD/policy.set" "$TMPD/policy.new"
     pol_write "$TMPD/policy.new"
     fw_sync
 }
 
-# Usage: enforce_limits         -> after traffic-save: blocks keys that reached their limit, unblocks the ones below it
+# Usage: enforce_limits         -> every minute (traffic-save): blocks keys that reached their traffic limit or their end,
+#                                  starts the clock of "after first connection" keys, unblocks keys whose limit was raised
 enforce_limits() {
     [ -s "$POLICY_DB" ] || return 0
     traffic_merge totals > "$TMPD/totals"
-    if awk -F'\t' -v OFS='\t' '
-            FILENAME == ARGV[1] { tot[$1] = $2 + $3; next }
-            { over = ($4 + 0 > 0 && (tot[$2] + 0) >= $4 + 0) ? 1 : 0; if (over != $5 + 0) changed = 1; print $1, $2, $3, $4, over }
-            END { exit changed ? 0 : 1 }' "$TMPD/totals" "$POLICY_DB" > "$TMPD/policy.new"; then
+    pol_calc "$POLICY_DB" "$TMPD/policy.new"
+    if ! cmp -s "$TMPD/policy.new" "$POLICY_DB"; then
         pol_write "$TMPD/policy.new"
         fw_sync
         logger -t wg-api-helper "result=OK action=enforce-limits"
@@ -1445,6 +1534,17 @@ cmd_limit() {
     pol_set "$1" "$pub" - "$2"
     logger -t wg-api-helper "result=OK action=limit ip=$1 bytes=$2"
     echo "OK: limit $2 ($1)"
+}
+
+# Usage: cmd_expiry <ip> <spec> -> time limit: 0 (none) | at:<epoch> | in:<n>h|d|w|m (from now) | after:<n>h|d|w|m
+#                                  (from the key's first connection). A key past its end is blocked until it gets a new one.
+cmd_expiry() {
+    local pub
+    valid_expiry "$2" || fail "invalid expiry"
+    pub="$(key_of "$1")"
+    pol_set "$1" "$pub" - - "$2"
+    logger -t wg-api-helper "result=OK action=expiry ip=$1 spec=$2"
+    echo "OK: expiry $2 ($1)"
 }
 
 # Usage: traffic_drop <pubkey>  -> forgets the saved traffic of a removed key
@@ -1504,7 +1604,7 @@ cmd_rename() {
 #                                  address. The optional private key on stdin must belong to <pubkey>; it is stored for
 #                                  GET /keys. Empty <name>/<ip>/<limit> mean: none / pick one / unlimited.
 cmd_add_auto() {
-    local pub="$1" name="${2:-}" want="${3:-}" limit="${4:-}" ip priv=""
+    local pub="$1" name="${2:-}" want="${3:-}" limit="${4:-}" exp="${5:-}" ip priv=""
     is_valid_pubkey "$pub" || fail "invalid public key"
     if [ -n "$name" ]; then valid_name "$name" || fail "invalid name"; fi
     if [ -n "$want" ]; then
@@ -1512,6 +1612,7 @@ cmd_add_auto() {
         if grep -Eq "^AllowedIPs[[:space:]]*=[[:space:]]*${want//./\\.}/32[[:space:]]*\$" "$WG_CONF"; then fail "ip already allocated: $want"; fi
     fi
     if [ -n "$limit" ]; then valid_bytes "$limit" || fail "invalid limit"; fi
+    if [ -n "$exp" ]; then valid_expiry "$exp" || fail "invalid expiry"; fi
     if [ ! -t 0 ]; then IFS= read -r priv || true; fi
     if [ -n "$priv" ]; then
         is_valid_pubkey "$priv" || fail "invalid private key"
@@ -1520,13 +1621,16 @@ cmd_add_auto() {
     if [ -n "$want" ]; then ip="$want"; else ip="$(next_free_ip)" || fail "IP pool exhausted"; fi
     cmd_add "$pub" "$ip" >/dev/null
     db_put "$ip" "$pub" "${priv:--}" "" "$name"
-    if [ -n "$limit" ] && [ "$limit" != "0" ]; then pol_set "$ip" "$pub" 0 "$limit"; fi
+    if { [ -n "$limit" ] && [ "$limit" != "0" ]; } || { [ -n "$exp" ] && [ "$exp" != "0" ]; }; then
+        pol_set "$ip" "$pub" 0 "${limit:-0}" "${exp:-0}"
+    fi
     echo "$ip"
 }
 
 # Usage: cmd_keys [<ip>]        -> one line per peer in wg0.conf:
 #        ip<TAB>client pubkey<TAB>private key or -<TAB>created epoch or 0<TAB>rx<TAB>tx<TAB>last handshake epoch<TAB>name
 #        <TAB>paused 0/1<TAB>limit bytes (0 = unlimited)<TAB>over the limit 0/1
+#        <TAB>ends at epoch (0 = none yet)<TAB>duration after first connection or -<TAB>first connection epoch<TAB>expired 0/1
 #        (keys added by hand or before clients.db existed have no private key: '-')
 cmd_keys() {
     local want="${1:-}"
@@ -1544,14 +1648,15 @@ cmd_keys() {
                 nm = mine ? dbname[ip] : ""
                 h = (pub in hs && hs[pub] + 0 > 0) ? hs[pub] : (pub in ths ? ths[pub] : 0)
                 pol = (ip in ppub && ppub[ip] == pub)
-                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in trx ? trx[pub] : 0), (pub in ttx ? ttx[pub] : 0), h, nm, (pol ? ppa[ip] + 0 : 0), (pol ? plim[ip] + 0 : 0), (pol ? pov[ip] + 0 : 0)
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip, pub, p, c, (pub in trx ? trx[pub] : 0), (pub in ttx ? ttx[pub] : 0), h, nm, (pol ? ppa[ip] + 0 : 0), (pol ? plim[ip] + 0 : 0), (pol ? pov[ip] + 0 : 0), (pol ? pex[ip] + 0 : 0), (pol && pdu[ip] != "" ? pdu[ip] : "-"), (pol ? pfi[ip] + 0 : 0), (pol ? ped[ip] + 0 : 0)
             }
             pub = ""; ip = ""
         }
         FILENAME == ARGV[1] { split($0, f, "\t"); dbpub[f[1]] = f[2]; dbpriv[f[1]] = f[3]; dbtime[f[1]] = f[4]; dbname[f[1]] = f[5]; next }
         FILENAME == ARGV[2] { split($0, f, "\t"); if (FNR > 1) { hs[f[1]] = f[5] }; next }
         FILENAME == ARGV[3] { split($0, f, "\t"); trx[f[1]] = f[2]; ttx[f[1]] = f[3]; ths[f[1]] = f[4]; next }
-        FILENAME == ARGV[4] { split($0, f, "\t"); ppub[f[1]] = f[2]; ppa[f[1]] = f[3]; plim[f[1]] = f[4]; pov[f[1]] = f[5]; next }
+        FILENAME == ARGV[4] { split($0, f, "\t"); ppub[f[1]] = f[2]; ppa[f[1]] = f[3]; plim[f[1]] = f[4]; pov[f[1]] = f[5]
+                              pex[f[1]] = f[6]; pdu[f[1]] = f[7]; pfi[f[1]] = f[8]; ped[f[1]] = f[9]; next }
         /^\[/ { flush(); next }
         /^PublicKey[ \t]*=/  { v = $0; sub(/^PublicKey[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v); pub = v; next }
         /^AllowedIPs[ \t]*=/ { v = $0; sub(/^AllowedIPs[ \t]*=[ \t]*/, "", v); n = split(v, a, /[ \t]*,[ \t]*/)
@@ -1568,10 +1673,11 @@ load_network
 case "${1:-}" in
     used-ips) [ "$#" -eq 1 ] || fail "usage: used-ips";           cmd_used_ips ;;
     add)      [ "$#" -eq 3 ] || fail "usage: add <pubkey> <ip>";  cmd_add "$2" "$3" ;;
-    add-auto) [ "$#" -ge 2 ] && [ "$#" -le 5 ] || fail "usage: add-auto <pubkey> [<name>] [<ip>] [<limit bytes>]"; cmd_add_auto "$2" "${3:-}" "${4:-}" "${5:-}" ;;
+    add-auto) [ "$#" -ge 2 ] && [ "$#" -le 6 ] || fail "usage: add-auto <pubkey> [<name>] [<ip>] [<limit bytes>] [<expiry>]"; cmd_add_auto "$2" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
     pause)    [ "$#" -eq 2 ] || fail "usage: pause <ip>";         cmd_pause "$2" ;;
     resume)   [ "$#" -eq 2 ] || fail "usage: resume <ip>";        cmd_resume "$2" ;;
     limit)    [ "$#" -eq 3 ] || fail "usage: limit <ip> <bytes>"; cmd_limit "$2" "$3" ;;
+    expiry)   [ "$#" -eq 3 ] || fail "usage: expiry <ip> 0|at:<epoch>|in:<n>h|d|w|m|after:<n>h|d|w|m"; cmd_expiry "$2" "$3" ;;
     rename)   [ "$#" -eq 3 ] || fail "usage: rename <ip> <name>"; cmd_rename "$2" "$3" ;;
     keys)     [ "$#" -le 2 ] || fail "usage: keys [<ip>]";        cmd_keys "${2:-}" ;;
     remove)   [ "$#" -eq 2 ] || fail "usage: remove <ip>";        cmd_remove "$2" ;;
@@ -1741,9 +1847,9 @@ const CLIENT_DNS = '__DNS__';
 // WG_API_HELPER: test override only; in production sudoers allows nothing but the real path
 const HELPER = process.env.WG_API_HELPER || '/usr/local/bin/wg-api-helper';
 // reported by GET /server; Mithra WireGuard Manager uses it to know which routes exist
-const API_VERSION = '2.1';
+const API_VERSION = '2.2';
 // what this server can do beyond listing/creating/removing keys (the app shows the matching buttons)
-const FEATURES = ['names', 'pause', 'limit', 'createAt'];
+const FEATURES = ['names', 'pause', 'limit', 'createAt', 'expiry'];
 const STARTED_MS = Date.now();
 
 // Usage: sameSecret(a, b) -> true if two strings are equal (constant time)
@@ -1815,6 +1921,45 @@ function trafficFrom(req) {
     return n === undefined ? NaN : n;
 }
 
+// Usage: parseDuration("30d") -> "30d"; "1 month" -> "1m"; "2 weeks" -> "2w"; 12 -> "12d" (a number is days);
+//        "never" / "none" / "0" / null -> null (no time limit); undefined for anything invalid.
+//        Units: h hours, d days, w weeks, m months (calendar months; "m" is months, not minutes). 1..9999 of them.
+function parseDuration(v) {
+    if (v === null || v === 0 || v === false) return null;
+    if (typeof v === 'number') return Number.isInteger(v) && v > 0 && v < 10000 ? v + 'd' : undefined;
+    if (typeof v !== 'string') return undefined;
+    const t = v.trim().toLowerCase();
+    if (/^(|0|never|none|off|no|unlimited)$/.test(t)) return null;
+    const m = /^(\d{1,4})\s*(h|hours?|d|days?|w|weeks?|m|mo|mon|months?)$/.exec(t);
+    if (!m || +m[1] < 1) return undefined;
+    return (+m[1]) + ({ h: 'h', d: 'd', w: 'w', m: 'm' })[m[2][0]];
+}
+
+// Usage: expiryFrom(req) -> the helper's expiry spec ("0", "in:30d", "at:<epoch>", "after:30d"), undefined when the
+//        request sets none, NaN when it is not valid. Body fields:
+//          "expires": "30d" | "1m" | "2026-12-31" (end of that day, UTC) | "2026-12-31T18:00:00Z" | "never"
+//          "expiresAfterFirstConnection": "30d" | "1m"   (the clock starts at the key's first connection)
+function expiryFrom(req) {
+    const b = (req.body && typeof req.body === 'object') ? req.body : {};
+    if ('expiresAfterFirstConnection' in b) {
+        const d = parseDuration(b.expiresAfterFirstConnection);
+        return d === undefined ? NaN : (d === null ? '0' : 'after:' + d);
+    }
+    if (!('expires' in b)) return undefined;
+    const v = b.expires;
+    const d = parseDuration(v);
+    if (d === null) return '0';
+    if (d !== undefined) return 'in:' + d;
+    if (typeof v !== 'string') return NaN;
+    const t = v.trim();
+    let ms = NaN;
+    const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
+    if (day) ms = Date.UTC(+day[1], +day[2] - 1, +day[3], 23, 59, 59);
+    else if (/^\d{4}-\d{2}-\d{2}T/.test(t)) ms = Date.parse(t);
+    const sec = Math.floor(ms / 1000);
+    return Number.isFinite(sec) && sec > 1e9 && sec < 1e11 ? 'at:' + sec : NaN;
+}
+
 // Usage: keyObject({ip, publicKey, privateKey, created, rx, tx, hs, paused, limit, over}) -> one key as returned by
 //        /keys and /create?format=json. privateKey/config are null for keys whose private key the server never saw.
 function keyObject(k) {
@@ -1841,12 +1986,16 @@ function keyObject(k) {
         dataLimitBytes: limit,                              // 0 = unlimited
         dataLimit: limit ? { bytes: limit } : null,         // Outline's shape
         limitReached: !!(limit && k.over),
-        status: k.paused ? 'paused' : (limit && k.over ? 'limit' : 'active'),
+        expiresAt: k.exp ? new Date(k.exp * 1000).toISOString() : null,                  // null = no end (yet)
+        expiresAfterFirstConnection: k.dur || null,                                      // e.g. "30d", "1m"
+        firstConnectedAt: k.first ? new Date(k.first * 1000).toISOString() : null,
+        expired: !!k.expd,
+        status: k.paused ? 'paused' : (limit && k.over ? 'limit' : (k.expd ? 'expired' : 'active')),
         config: k.privateKey ? buildConfig(k.privateKey, k.ip) : null
     };
 }
 
-// Usage: parseKeys(helperOutput) -> [keyObject...] from 'wg-api-helper keys' (11 tab-separated fields per line)
+// Usage: parseKeys(helperOutput) -> [keyObject...] from 'wg-api-helper keys' (15 tab-separated fields per line)
 function parseKeys(text) {
     return text.split('\n').filter(Boolean).map(line => {
         const f = line.split('\t');
@@ -1854,7 +2003,9 @@ function parseKeys(text) {
             ip: f[0], publicKey: f[1], privateKey: f[2] === '-' ? null : f[2],
             created: parseInt(f[3], 10) || 0, rx: parseInt(f[4], 10) || 0,
             tx: parseInt(f[5], 10) || 0, hs: parseInt(f[6], 10) || 0, name: f[7] || '',
-            paused: f[8] === '1', limit: parseInt(f[9], 10) || 0, over: f[10] === '1'
+            paused: f[8] === '1', limit: parseInt(f[9], 10) || 0, over: f[10] === '1',
+            exp: parseInt(f[11], 10) || 0, dur: f[12] && f[12] !== '-' ? f[12] : '', first: parseInt(f[13], 10) || 0,
+            expd: f[14] === '1'
         });
     });
 }
@@ -1869,6 +2020,7 @@ function helperFailure(err, fallback) {
     if (/IP pool exhausted/.test(msg)) return { status: 503, error: 'IP pool exhausted' };
     if (/ip already allocated/.test(msg)) return { status: 409, error: 'ip already in use' };
     if (/invalid limit/.test(msg)) return { status: 400, error: 'invalid traffic limit' };
+    if (/invalid expiry/.test(msg)) return { status: 400, error: 'invalid time limit' };
     return { status: 500, error: fallback };
 }
 
@@ -1908,18 +2060,25 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Usage: createKey(name, ip, limit) -> keyObject of a new key at <ip> (or the first free address) with a traffic
-//        limit in bytes (0 = unlimited); the private key is kept for GET /keys
-function createKey(name, ip, limit) {
+// Usage: createKey(name, ip, limit, expiry) -> keyObject of a new key at <ip> (or the first free address) with a traffic
+//        limit in bytes (0 = unlimited) and a time limit (helper spec, '' = none); the private key is kept for GET /keys
+function createKey(name, ip, limit, expiry) {
     const privateKey = execFileSync('wg', ['genkey'], { encoding: 'utf8' }).trim();
     const publicKey = execFileSync('wg', ['pubkey'], { input: privateKey, encoding: 'utf8' }).trim();
-    const clientIP = helper(['add-auto', publicKey, name || '', ip || '', limit ? String(limit) : ''], privateKey + '\n').trim();
+    const clientIP = helper(['add-auto', publicKey, name || '', ip || '', limit ? String(limit) : '', expiry || ''],
+        privateKey + '\n').trim();
     if (!IPV4.test(clientIP)) throw new Error('helper returned an unexpected address');
-    return keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000), limit: limit || 0 });
+    const stored = parseKeys(helper(['keys', clientIP]))[0];
+    return stored && stored.privateKey ? stored
+        : keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000), limit: limit || 0 });
 }
 
-// Usage: createRequest(req) -> { name, ip, limit } from the body / query, or { error } (400)
-//        {"name": "...", "ipAddress": "10.66.0.2", "traffic": "20G"} - every field optional
+const EXPIRY_HELP = 'invalid time limit: use "expires": "30d", "1m", "2026-12-31" or "never", ' +
+    'or "expiresAfterFirstConnection": "30d" (units h, d, w, m = months)';
+
+// Usage: createRequest(req) -> { name, ip, limit, expiry } from the body / query, or { error } (400)
+//        {"name": "...", "ipAddress": "10.66.0.2", "traffic": "20G", "expires": "30d"} - every field optional
+//        (or "expiresAfterFirstConnection": "1m" instead of "expires")
 function createRequest(req) {
     const b = (req.body && typeof req.body === 'object') ? req.body : {};
     const name = cleanName(b.name || req.query.name);
@@ -1927,7 +2086,9 @@ function createRequest(req) {
     if (ipText && (typeof ipText !== 'string' || !IPV4.test(ipText.split('/')[0]))) return { error: 'invalid ipAddress format' };
     const limit = trafficFrom(req);
     if (Number.isNaN(limit)) return { error: 'invalid traffic: use e.g. "20G", "500M", "1.5T", a number of bytes, or "unlimited"' };
-    return { name, ip: ipText ? ipText.split('/')[0] : '', limit: limit || 0 };
+    const expiry = expiryFrom(req);
+    if (Number.isNaN(expiry)) return { error: EXPIRY_HELP };
+    return { name, ip: ipText ? ipText.split('/')[0] : '', limit: limit || 0, expiry: expiry || '' };
 }
 
 // POST /create            -> client config as text/plain (backward compatible)
@@ -1937,7 +2098,7 @@ app.post('/create', (req, res) => {
     const r = createRequest(req);
     if (r.error) return res.status(400).json({ error: r.error });
     try {
-        const key = createKey(r.name, r.ip, r.limit);
+        const key = createKey(r.name, r.ip, r.limit, r.expiry);
         if (req.query.format === 'json') return res.json(key);
         res.type('text/plain').send(key.config);
     } catch (err) {
@@ -1952,7 +2113,7 @@ app.post('/access-keys', (req, res) => {
     const r = createRequest(req);
     if (r.error) return res.status(400).json({ error: r.error });
     try {
-        res.status(201).json(createKey(r.name, r.ip, r.limit));
+        res.status(201).json(createKey(r.name, r.ip, r.limit, r.expiry));
     } catch (err) {
         console.error('create failed:', err.message);
         const f = helperFailure(err, 'create failed');
@@ -2159,6 +2320,19 @@ app.put(['/keys/:ip/limit', '/access-keys/:ip/limit', '/access-keys/:ip/data-lim
     keyAction(res, req.params.ip, ['limit', String(limit)]);
 });
 app.delete(['/keys/:ip/limit', '/access-keys/:ip/limit', '/access-keys/:ip/data-limit'], (req, res) => keyAction(res, req.params.ip, ['limit', '0']));
+
+// PUT /keys/:ip/expiry {"expires": "30d"}                       -> ends 30 days from now ("1m" = one calendar month,
+//                                                                   "2026-12-31" = end of that day UTC, "never" = no end)
+// PUT /keys/:ip/expiry {"expiresAfterFirstConnection": "30d"}   -> ends 30 days after the key's first connection
+//                                                                   (now, if it has connected before)
+// DELETE /keys/:ip/expiry                                        -> no time limit
+// A key past its end is blocked until it gets a later end or none; its config and usage stay.
+app.put(['/keys/:ip/expiry', '/access-keys/:ip/expiry'], (req, res) => {
+    const spec = expiryFrom(req);
+    if (spec === undefined || Number.isNaN(spec)) return res.status(400).json({ error: EXPIRY_HELP });
+    keyAction(res, req.params.ip, ['expiry', spec]);
+});
+app.delete(['/keys/:ip/expiry', '/access-keys/:ip/expiry'], (req, res) => keyAction(res, req.params.ip, ['expiry', '0']));
 
 app.listen(__API_PORT__, '127.0.0.1', () => {
     console.log('wg-api listening on 127.0.0.1:__API_PORT__');
@@ -2399,7 +2573,7 @@ update_api() {
             chmod 600 "$ACCESS_OUTLINE_FILE"
         fi
     fi
-    ok "wg-api updated (API 2.1): pause/resume, traffic limits, create at a chosen address, IPv6 kept in the tunnel"
+    ok "wg-api updated (API 2.2): pause/resume, traffic and time limits, create at a chosen address, IPv6 kept in the tunnel"
     echo "  Client configs now use AllowedIPs = 0.0.0.0/0, ::/0. Devices that imported a key before this update"
     echo "  keep the old config: re-import it (QR / .conf in the app) to stop IPv6 leaking around the tunnel."
     echo
@@ -2594,6 +2768,9 @@ print_success_message() {
         echo "  Change the limit later / remove it:"
         echo "    curl ${tlsopts}-X PUT ${API_URL}/keys/$(sample_ip)/limit -H \"Authorization: Bearer ${API_TOKEN}\" \\"
         echo "      -H 'Content-Type: application/json' -d '{\"traffic\":\"50G\"}'      # or {\"traffic\":\"unlimited\"}"
+        echo "  Time limit: 30 days from now, or 1 month from the key's first connection (\"never\" removes it):"
+        echo "    curl ${tlsopts}-X PUT ${API_URL}/keys/$(sample_ip)/expiry -H \"Authorization: Bearer ${API_TOKEN}\" \\"
+        echo "      -H 'Content-Type: application/json' -d '{\"expires\":\"30d\"}'      # or {\"expiresAfterFirstConnection\":\"1m\"}"
         echo "  Pause / resume a key:"
         echo "    curl ${tlsopts}-X POST ${API_URL}/keys/$(sample_ip)/pause -H \"Authorization: Bearer ${API_TOKEN}\"     # .../resume"
         echo
