@@ -105,7 +105,7 @@ MONITOR_KEY_FILE=""
 MONITOR_MARK="# wg-monitor (install-wg-full.sh)"
 
 BIN_DIR="/usr/local/bin"
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.2.2"
 # the health tools are fetched from this exact commit and must match these hashes (update both together)
 REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/1764dec2a35b2f054217496e9e3ea929ebb59fe0"
 declare -A TOOL_SHA256=(
@@ -1953,15 +1953,17 @@ function trafficFrom(req) {
 
 // Usage: parseDuration("30d") -> "30d"; "1 month" -> "1m"; "2 weeks" -> "2w"; 12 -> "12d" (a number is days);
 //        "never" / "none" / "0" / null -> null (no time limit); undefined for anything invalid.
-//        Units: h hours, d days, w weeks, m months (calendar months; "m" is months, not minutes). 1..9999 of them.
+//        Units: h hours, d days, w weeks, m months (calendar months; "m" is months, not minutes), y years (= 12 calendar
+//        months, so "1y" is stored as "12m"). 1..9999 of them (years: 1..833).
 function parseDuration(v) {
     if (v === null || v === 0 || v === false) return null;
     if (typeof v === 'number') return Number.isInteger(v) && v > 0 && v < 10000 ? v + 'd' : undefined;
     if (typeof v !== 'string') return undefined;
     const t = v.trim().toLowerCase();
     if (/^(|0|never|none|off|no|unlimited)$/.test(t)) return null;
-    const m = /^(\d{1,4})\s*(h|hours?|d|days?|w|weeks?|m|mo|mon|months?)$/.exec(t);
+    const m = /^(\d{1,4})\s*(h|hours?|d|days?|w|weeks?|m|mo|mon|months?|y|yrs?|years?)$/.exec(t);
     if (!m || +m[1] < 1) return undefined;
+    if (m[2][0] === 'y') return +m[1] * 12 < 10000 ? (+m[1] * 12) + 'm' : undefined;
     return (+m[1]) + ({ h: 'h', d: 'd', w: 'w', m: 'm' })[m[2][0]];
 }
 
@@ -2103,8 +2105,8 @@ function createKey(name, ip, limit, expiry) {
         : keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000), limit: limit || 0 });
 }
 
-const EXPIRY_HELP = 'invalid time limit: use "expires": "30d", "1m", "2026-12-31" or "never", ' +
-    'or "expiresAfterFirstConnection": "30d" (units h, d, w, m = months)';
+const EXPIRY_HELP = 'invalid time limit: use "expires": "30d", "1m", "1y", "12h", "2026-12-31" or "never", ' +
+    'or "expiresAfterFirstConnection": "30d" (units h, d, w, m = months, y = years)';
 
 // Usage: createRequest(req) -> { name, ip, limit, expiry } from the body / query, or { error } (400)
 //        {"name": "...", "ipAddress": "10.66.0.2", "traffic": "20G", "expires": "30d"} - every field optional
