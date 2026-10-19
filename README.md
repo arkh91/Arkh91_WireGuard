@@ -6,25 +6,47 @@ a central management server (e.g. "US08") pull traffic stats and enforce peer
 limits.
 
 `install-wg-full.sh` is the installer to use. It sets up everything in one
-run: WireGuard, the API, the health tools, a daily health-check timer, and
-(optionally) the `wg-monitor` account.
+run: WireGuard, the firewall rules, the API, the health tools, a daily health-check
+timer, and (optionally) the `wg-monitor` account.
+
+Current version: **2.1.1** (API 2.1). New in 2.1:
+* **Pause / resume** a key, and a **traffic limit** per key (or unlimited), from the API and from
+  Mithra WireGuard Manager. A key can also be created at a chosen address with a limit.
+* **Client isolation:** VPN clients can no longer reach each other, private / cloud-metadata
+  networks, or the server's own services.
+* **Suspensions can't be bypassed:** paused, over-limit and suspended keys are always checked
+  first, and stay blocked across restarts and reboots.
+* **No IPv6 leak:** client configs send IPv6 into the tunnel (`AllowedIPs = 0.0.0.0/0, ::/0`).
+* **Checked downloads:** the health tools come from a fixed commit and must match a SHA-256;
+  no script is piped from NodeSource; npm packages are pinned.
+* The access config lines in the installer's summary are printed in **green**.
+
+Already running an older version? See [Updating installed servers](#updating-installed-servers).
 
 ---
 
 ## Install
 
-Run it directly from GitHub (arguments go **after** the closing `)`):
+Recommended: download a tagged release, check its SHA-256, then run it. The script runs as root,
+so this makes sure you run exactly the reviewed file:
+
+```bash
+curl -fsSLo install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/v2.1.1/install-wg-full.sh
+echo "555b961d6b544d95f4d7387af82ecff38d90bf8d9b21a10232340798eaa4f3cb  install-wg-full.sh" | sha256sum -c -
+sudo bash install-wg-full.sh
+```
+```bash
+# non-interactive example (flags go after the script name)
+sudo bash install-wg-full.sh --domain=vpn.example.com --port=39022 --https-port=2053 --yes
+```
+
+Mithra WireGuard Manager's **Add server** screen shows the same command with a Copy button.
+
+Quick but unchecked (always runs whatever is on `main` at that moment; arguments go **after** the closing `)`):
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh)
 ```
-```bash
-# non-interactive example
-bash <(curl -Ls https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh) \
-    --domain=vpn.example.com --port=39022 --https-port=2053 --yes
-```
-
-or from a local copy: `sudo ./install-wg-full.sh`.
 
 Putting a flag *before* the closing `)` (for example `curl -Ls <url> --add-monitor`)
 does not work: `curl` parses it as its own option and rejects it.
@@ -44,12 +66,17 @@ from a management server, add it with `--monitor-key-file=/root/wg_monitor_key.p
 time or `--add-monitor` later (see [below](#1-generate-the-key-once-on-us08)).
 
 At the end it prints **WIREGUARD SERVER INSTALLED** with the API URL, HTTPS port,
-Bearer token, certificate fingerprint and ready-to-copy commands. The same access
-details are saved in `/etc/wg-api/access.json`:
+Bearer token, certificate fingerprint and ready-to-copy commands. The two **access config**
+lines (the ones starting with `{"apiUrl"`) are printed in **green** so they are easy to find:
+paste either one into Mithra WireGuard Manager (**Add server**). Both open every key on the
+server, so treat them like passwords. They are also saved on the server:
 
-```json
-{ "apiUrl": "https://vpn.example.com:2053", "apiToken": "...", "certSha256": "..." }
+```bash
+sudo cat /etc/wg-api/access.json           # {"apiUrl":"https://vpn.example.com:2053","apiToken":"...","certSha256":"..."}
+sudo cat /etc/wg-api/access-outline.json   # {"apiUrl":"https://vpn.example.com:2053/<secret>","certSha256":"..."}  (Outline format)
 ```
+
+(The colour is only used on a terminal; piped output and `NO_COLOR=1` stay plain.)
 
 ### Options
 
@@ -66,6 +93,8 @@ details are saved in `/etc/wg-api/access.json`:
 | `--monitor-key="ssh-..."` / `--monitor-key-file=FILE` | `wg-monitor` public key of the management server |
 | `--no-api` | WireGuard + tools only, no Caddy/Node/API |
 | `--no-caddy` | install the API but not Caddy (when nginx or another web server already owns 80/443) |
+| `--allow-client-to-client` | let VPN clients reach each other (default: blocked) |
+| `--allow-private-nets` | let VPN clients reach private, link-local (cloud metadata) and CGNAT addresses (default: blocked) |
 | `--force` | replace an existing `wg0.conf` (a backup is made first) |
 | `--yes`, `-y` | do not ask questions |
 
@@ -74,30 +103,118 @@ details are saved in `/etc/wg-api/access.json`:
 ```bash
 sudo ./install-wg-full.sh --add-monitor --monitor-key-file=/root/wg_monitor_key.pub  # add/repair wg-monitor on an installed node
 sudo ./install-wg-full.sh --reconfigure-api   # change the API HTTPS port / certificate (WireGuard keys and peers untouched)
-sudo ./install-wg-full.sh --update-api        # rewrite wg-api-helper and server.js to the current version (adds /usage); keys and peers untouched
-sudo ./install-wg-full.sh --update-tools      # re-fetch wg-healthcheck.sh and vpn-doctor.sh
+sudo ./install-wg-full.sh --update-api        # bring an installed server to this version: API, helper, firewall; keys and peers untouched
+sudo ./install-wg-full.sh --update-firewall   # only the firewall part of --update-api (live, no restart)
+sudo ./install-wg-full.sh --update-tools      # re-fetch wg-healthcheck.sh and vpn-doctor.sh (checked against their SHA-256)
 sudo ./install-wg-full.sh --uninstall         # remove everything this script installed
 ```
 
 `--add-monitor` is the one to use for a node set up before the account existed,
 or where SSH asks for a password instead of using the key.
 
+Started without arguments, the script shows a menu; option **6** is the same as `--update-api`.
+
+---
+
+## Updating installed servers
+
+Every server installed with an older `install-wg-full.sh` is brought to 2.1.1 with one command.
+It keeps every key, peer, token, certificate and the HTTPS port; `wg0` is **not** restarted, so
+connected clients stay connected (only `wg-api` restarts, for a second or two).
+
+On each server:
+
+```bash
+curl -fsSLo install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/v2.1.1/install-wg-full.sh
+echo "555b961d6b544d95f4d7387af82ecff38d90bf8d9b21a10232340798eaa4f3cb  install-wg-full.sh" | sha256sum -c -
+sudo bash install-wg-full.sh --update-api
+```
+
+Mithra WireGuard Manager 1.2 shows this command (with a Copy button) on every server that still
+runs an older API, together with the note that pause and traffic limits need the update.
+
+What `--update-api` changes:
+
+1. **Firewall:** installs `/usr/local/bin/wg-firewall.sh`, replaces the old filter lines in
+   `wg0.conf`'s PostUp/PostDown with it (the NAT lines and all `[Peer]` blocks stay; a backup
+   `wg0.conf.bak-<date>` is made) and applies the new rules live. Suspensions that existed only
+   in iptables are carried over to `/etc/wireguard/suspended.list`.
+2. **API:** rewrites `wg-api-helper` and `server.js` (API 2.1), reinstalls the pinned npm
+   packages, makes `/opt/wg-api` owned by root, rewrites `wg-api.service` and restarts it.
+3. **wg-peer-ctrl.sh:** suspensions from the management server now go through the same
+   state file, so they survive restarts.
+4. Prints both access configs again (in green).
+
+**Afterwards:** client configs now contain `AllowedIPs = 0.0.0.0/0, ::/0`. Devices that imported a
+key **before** the update still have the old config; re-import it once (QR code or `.conf` from
+the app, or `GET /keys/<ip>`) to stop IPv6 from bypassing the tunnel.
+
+Check a server after the update:
+
+```bash
+sudo wg-firewall.sh status | head -12       # FORWARD starts with -j WG-SUSPEND, then WG-GUARD
+curl --insecure --pinnedpubkey "$PIN" "$URL/server" -H "Authorization: Bearer $TOKEN"   # "apiVersion":"2.1"
+```
+
+Many servers at once, from a machine that can SSH to them as root:
+
+```bash
+for h in us08.example.com de01.example.com; do
+  ssh root@"$h" 'curl -fsSLo /root/install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/v2.1.1/install-wg-full.sh &&
+    echo "555b961d6b544d95f4d7387af82ecff38d90bf8d9b21a10232340798eaa4f3cb  /root/install-wg-full.sh" | sha256sum -c - &&
+    bash /root/install-wg-full.sh --update-api --yes' || echo "FAILED: $h"
+done
+```
+
 ---
 
 ## Management API
 
-All endpoints except `/health` need the header `Authorization: Bearer <apiToken>`.
+All endpoints except `/health` need the header `Authorization: Bearer <apiToken>`
+(or, with the Outline-format access config, the secret path: `https://host:port/<secret>/keys`).
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /create` | create a key; returns the client config as text (`?format=json` for JSON) |
-| `POST /remove` | remove a key, body `{"ipAddress":"10.66.0.2"}` |
-| `GET /usage` | **all keys**: upload/download bytes, last handshake, plus totals |
+| `POST /create` | create a key; returns the client config as text (`?format=json` for JSON). Optional body `{"name":"Ali phone","ipAddress":"10.66.0.2","traffic":"20G"}` |
+| `POST /access-keys` | same as `/create?format=json`, answers `201` (Outline Manager's call) |
+| `GET /keys` (also `GET /`, `GET /access-keys`) | **all keys** with their full settings, ready config, usage, pause and limit state |
+| `GET /keys/<ip>` | one key |
+| `PUT /keys/<ip>/name` | rename, body `{"name":"Office laptop"}` |
+| `POST /keys/<ip>/pause` | **pause** a key: it stays configured, but no traffic passes |
+| `POST /keys/<ip>/resume` | lift the pause (also `PUT /keys/<ip>/paused {"paused":false}`) |
+| `PUT /keys/<ip>/limit` | set or change the **traffic limit**, body `{"traffic":"50G"}`; `{"traffic":"unlimited"}` removes it |
+| `DELETE /keys/<ip>/limit` | remove the traffic limit (unlimited) |
+| `POST /remove` | remove a key, body `{"ipAddress":"10.66.0.2"}` (also `DELETE /keys/<ip>`) |
+| `GET /usage` | **all keys**: upload/download bytes, last handshake, plus totals (light, for polling) |
 | `GET /usage/<ip>` | usage of **one key**, e.g. `/usage/10.66.0.2` |
+| `GET /server` | server facts: public key, endpoint, DNS, `apiVersion`, `features`, key count |
+| `GET /metrics/transfer` | `{"bytesTransferredByUserId": {"10.66.0.2": 12345}}` (Outline's usage call) |
 | `GET /health` | liveness check, no token needed |
 
-Errors: `401` wrong or missing token, `400` malformed address or one that is not a client
-address of this server, `404` unknown key, `503` address pool full.
+Every `/keys/<ip>/...` route also exists under `/access-keys/<ip>/...`; Outline's
+`PUT /access-keys/<ip>/data-limit {"limit":{"bytes":N}}` and `DELETE .../data-limit` work as well.
+
+Errors: `401` wrong or missing token, `400` malformed address, an address that is not a client
+address of this server, or a traffic value that is not understood, `404` unknown key,
+`409` the requested `ipAddress` is already in use, `503` address pool full.
+
+### Traffic limits and pausing
+
+* **Values:** `"20G"`, `"500M"`, `"1.5T"`, `"750 MB"`, a plain number of bytes (`20000000000`), or
+  `"unlimited"` / `0`. Units are decimal like the app shows them (1G = 1,000,000,000 bytes);
+  `KiB`/`MiB`/`GiB`/`TiB` are binary.
+* **What counts:** upload + download since the key was created (the same totals as `/usage`,
+  kept across restarts).
+* **Enforcement:** checked at once when the limit is set and then every minute. A key that
+  reaches its limit is blocked like a paused one (`"status":"limit"`, `"limitReached":true`) until
+  the limit is raised or removed; it then works again by itself. Because of the one-minute
+  check a busy key can go slightly over before it is stopped.
+* **Pause** blocks a key without removing it; its config keeps working after `resume`.
+* Both are enforced in the server's firewall (`WG-SUSPEND` chain), are saved in
+  `/etc/wg-api/policy.db`, and survive restarts and reboots.
+* Each key in `/keys` carries `paused`, `dataLimitBytes` (0 = unlimited), `dataLimit`
+  (`{"bytes":N}` or `null`, Outline's shape), `limitReached` and `status`
+  (`active` / `paused` / `limit`).
 
 A key is identified by its IP address. The default pool is `10.66.0.0/16`: the server is
 `10.66.0.1` and keys are handed out from `10.66.0.2` up to `10.66.255.254`, **65,533 keys** in total.
@@ -114,7 +231,24 @@ URL='https://vpn.example.com:2053'
 curl --insecure --pinnedpubkey "$PIN" -X POST "$URL/create" -H "Authorization: Bearer $TOKEN"
 curl --insecure --pinnedpubkey "$PIN" "$URL/usage"          -H "Authorization: Bearer $TOKEN"
 curl --insecure --pinnedpubkey "$PIN" "$URL/usage/10.66.0.2" -H "Authorization: Bearer $TOKEN"
+
+# a key at a chosen address with a 20 GB limit (both optional; the Content-Type header is required for the body)
+curl --insecure --pinnedpubkey "$PIN" -X POST "$URL/create?format=json" -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"ipAddress":"10.66.0.2","traffic":"20G"}'
+
+# change the limit, or remove it
+curl --insecure --pinnedpubkey "$PIN" -X PUT "$URL/keys/10.66.0.2/limit" -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"traffic":"50G"}'
+curl --insecure --pinnedpubkey "$PIN" -X PUT "$URL/keys/10.66.0.2/limit" -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"traffic":"unlimited"}'
+
+# pause and resume
+curl --insecure --pinnedpubkey "$PIN" -X POST "$URL/keys/10.66.0.2/pause"  -H "Authorization: Bearer $TOKEN"
+curl --insecure --pinnedpubkey "$PIN" -X POST "$URL/keys/10.66.0.2/resume" -H "Authorization: Bearer $TOKEN"
 ```
+
+Without `-H 'Content-Type: application/json'` the body is ignored: the key is still created,
+but at the next free address and without a limit.
 
 `GET /usage` response:
 
@@ -141,6 +275,37 @@ curl --insecure --pinnedpubkey "$PIN" "$URL/usage/10.66.0.2" -H "Authorization: 
   Servers installed before this version get it with `sudo ./install-wg-full.sh --update-api`.
 * To collect usage from several servers, keep each server's domain, HTTPS port,
   token and pin (all in its `access.json`) and poll `/usage` on each.
+* "Last seen" (`lastHandshake`) is saved with the usage too, so it no longer shows `never`
+  after a restart for a key that has connected before.
+
+---
+
+## Firewall
+
+`/usr/local/bin/wg-firewall.sh` makes wg0's filter rules. `wg-quick` runs it on every start
+(`PostUp`) and stop (`PostDown`); the NAT (MASQUERADE) rule stays on its own PostUp/PostDown lines.
+Because the whole block is rebuilt on every start in a fixed order, a restart can no longer move
+an ACCEPT rule above the suspensions.
+
+```text
+INPUT    -p udp --dport <wg port> -j ACCEPT
+INPUT    -i wg0 -j WG-IN           clients may ping the server and use DNS on it, nothing else
+FORWARD  -j WG-SUSPEND             paused keys, keys over their limit, wg-peer-ctrl suspensions
+FORWARD  -i wg0 -j WG-GUARD        no client-to-client; no 10/8, 172.16/12, 192.168/16, 169.254/16 (metadata), 100.64/10 ...
+FORWARD  -i wg0 -j ACCEPT
+FORWARD  -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+FORWARD  -o wg0 -j WG-NOINBOUND    nothing else may enter the tunnel from outside
+```
+
+```bash
+sudo wg-firewall.sh status          # show the rules
+sudo vi /etc/wireguard/wg-firewall.conf && sudo wg-firewall.sh up    # change an option, apply it
+```
+
+Options in `/etc/wireguard/wg-firewall.conf` (1 = on): `CLIENT_ISOLATION`, `BLOCK_PRIVATE_NETS`,
+`BLOCK_SERVER_ACCESS`. The block state lives in `/etc/wg-api/policy.db` (API) and
+`/etc/wireguard/suspended.list` (`wg-peer-ctrl.sh`), not in iptables, so it does not depend on
+`netfilter-persistent`.
 
 ### TLS modes and ports
 
@@ -161,7 +326,8 @@ curl --insecure --pinnedpubkey "$PIN" "$URL/usage/10.66.0.2" -H "Authorization: 
 
 ## Health tools
 
-Installed in `/usr/local/bin` and also runnable straight from GitHub:
+Installed in `/usr/local/bin` (downloaded from a fixed commit and checked against their SHA-256)
+and also runnable straight from GitHub:
 
 ```bash
 sudo wg-healthcheck.sh [--capture=20]      # health check (also runs daily from a systemd timer)
@@ -182,7 +348,16 @@ Enforcement actions are logged: `journalctl -t wg-peer-ctrl -f`.
   `ss -ltnp | grep -E 'caddy|node'`.
 * **`curl: (90) SSL: public key does not match pinned public key`**: the pin is from
   an older install, or a placeholder was left in the command. Recompute it (above).
-* **`Cannot GET /usage`**: the server still runs an older `server.js`; run `--update-api`.
+* **`Cannot GET /usage`**, or `404` on `/keys/<ip>/pause` or `/limit`: the server still runs an
+  older `server.js`; [update it](#updating-installed-servers).
+* **A key was created without its limit / at another address**: the request had no
+  `-H 'Content-Type: application/json'`, so the body was ignored.
+* **A paused or over-limit key still works**: check `sudo wg-firewall.sh status` shows
+  `-A FORWARD -j WG-SUSPEND` first and the key's address in `WG-SUSPEND`. On a server
+  that was never updated, a `wg0` restart moved the old ACCEPT rules above the suspensions;
+  run `--update-api`.
+* **`sha256sum: WARNING: 1 computed checksum did NOT match`**: the downloaded file is not the
+  2.1.1 release (wrong tag, or it changed). Do not run it.
 * **Caddy: `permission denied` on `/var/log/caddy/wg-api.log`**: fixed in the current
   installer; on an old install run `chown -R caddy:caddy /var/log/caddy && systemctl restart caddy`.
 
@@ -278,7 +453,7 @@ and validates every argument before touching anything.
 | *(empty)* | `wg show wg0 dump` — traffic sync |
 | `peer-disable <pubkey>` | Remove peer from WireGuard entirely (expired) |
 | `peer-enable <pubkey> <cidr>` | Re-add peer with its allowed-ips |
-| `peer-suspend <cidr>` | Block peer's traffic via a dedicated `WG-SUSPEND` iptables chain (peer stays in wg, handshakes still work) |
+| `peer-suspend <cidr>` | Block peer's traffic via the `WG-SUSPEND` iptables chain (peer stays in wg, handshakes still work); saved in `/etc/wireguard/suspended.list`, so it survives restarts |
 | `peer-unsuspend <cidr>` | Remove the block |
 | `peer-setlimit <cidr> <kbps>` | Cap the peer's bandwidth, both directions, via `tc` (htb + an `ifb0` device for the upload side) |
 | `peer-clearlimit <cidr>` | Remove the cap |
@@ -408,3 +583,9 @@ both fixed by re-running the installer with `--add-monitor`:
 * HTTPS management API tokens (from `/create`/`/remove`) are separate from
   this account entirely and should be rotated if ever pasted somewhere
   they could leak.
+* The access configs (the green lines) open every key on a server, including the
+  private keys: share them like passwords.
+* VPN clients are isolated from each other and from private / cloud-metadata networks
+  by default (see [Firewall](#firewall)).
+* Install and update from a tagged release with its SHA-256 checked
+  (see [Install](#install)); the health tools are pinned the same way inside the script.
