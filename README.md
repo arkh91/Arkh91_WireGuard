@@ -9,7 +9,35 @@ limits.
 run: WireGuard, the firewall rules, the API, the health tools, a daily health-check
 timer, and (optionally) the `wg-monitor` account.
 
-Current version: **2.1.1** (API 2.1). New in 2.1:
+Current version: **2.3.0** (API 2.3).
+
+New in 2.3.0:
+* **End on:** a time limit that ends at a fixed date and time, counted on the **server's clock** (its own
+  time zone): `{"expiresOn":"2026-12-31 18:00"}` (a date alone, `"2026-12-31"`, means the end of that day).
+  A time that has already passed is refused (HTTP 400, with the server's current time). The key is blocked
+  at that moment, like any expired key. `GET /server` now reports `timeZone`, `utcOffset` and `serverClock`; every
+  key has `expiresAtServer` (its end on the server's clock). `{"expires":"2026-12-31"}` now also means the
+  server's clock, not UTC. Mithra WireGuard Manager 1.3.5 has it as *Ends on a date and time (server time)*.
+
+New in 2.2.2:
+* Time limits also take **years** (`"1y"`, `"2 years"`; stored as 12 / 24 calendar months). Hours
+  (`"12h"`) already worked; Mithra WireGuard Manager 1.3.4 offers hours, days, weeks, months and years.
+
+New in 2.2.1:
+* **First connection and last handshake are stored for every key** (`/var/lib/wg-api/traffic.db`,
+  with the usage), so they survive `wg0` restarts and reboots. `firstConnectedAt` and `lastHandshake`
+  are in every key of `GET /keys`.
+* **Removing a key removes everything stored about it:** usage, handshakes, its stored config and
+  its pause / traffic / time limits. A new key that later gets the same address starts clean. Keys
+  removed by hand from `wg0.conf` are cleaned up the same way on the next minute's check.
+* Time limits "from first connection" now count from the key's real first connection.
+
+New in 2.2:
+* **Time limit per key:** ends after N days / weeks / months **from now** (or on a date), or N days /
+  weeks / months **from the key's first connection**. An expired key is blocked until it gets a new
+  time limit. From the API and from Mithra WireGuard Manager 1.3 (see [Time limits](#time-limits)).
+
+New in 2.1:
 * **Pause / resume** a key, and a **traffic limit** per key (or unlimited), from the API and from
   Mithra WireGuard Manager. A key can also be created at a chosen address with a limit.
 * **Client isolation:** VPN clients can no longer reach each other, private / cloud-metadata
@@ -19,7 +47,7 @@ Current version: **2.1.1** (API 2.1). New in 2.1:
 * **No IPv6 leak:** client configs send IPv6 into the tunnel (`AllowedIPs = 0.0.0.0/0, ::/0`).
 * **Checked downloads:** the health tools come from a fixed commit and must match a SHA-256;
   no script is piped from NodeSource; npm packages are pinned.
-* The access config lines in the installer's summary are printed in **green**.
+* The access config lines in the installer's summary are printed in **green** (2.1.1).
 
 Already running an older version? See [Updating installed servers](#updating-installed-servers).
 
@@ -27,12 +55,13 @@ Already running an older version? See [Updating installed servers](#updating-ins
 
 ## Install
 
-Recommended: download a tagged release, check its SHA-256, then run it. The script runs as root,
-so this makes sure you run exactly the reviewed file:
+Recommended: download the script, check its SHA-256, then run it. The script runs as root, so this
+makes sure you run exactly the reviewed 2.3.0 file (if `main` has moved on, the check fails and nothing
+runs: use the command from the newer README or the app):
 
 ```bash
-curl -fsSLo install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/v2.1.1/install-wg-full.sh
-echo "555b961d6b544d95f4d7387af82ecff38d90bf8d9b21a10232340798eaa4f3cb  install-wg-full.sh" | sha256sum -c -
+curl -fsSLo install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh
+echo "71ecfb389a70b6c98535096c09f0dcf5f920bd054a3ee9f136a88234e1fb7625  install-wg-full.sh" | sha256sum -c -
 sudo bash install-wg-full.sh
 ```
 ```bash
@@ -118,15 +147,16 @@ Started without arguments, the script shows a menu; option **6** is the same as 
 
 ## Updating installed servers
 
-Every server installed with an older `install-wg-full.sh` is brought to 2.1.1 with one command.
+Every server installed with an older `install-wg-full.sh` is brought to 2.3.0 with one command
+(also servers already on 2.1.x: that adds the time limits).
 It keeps every key, peer, token, certificate and the HTTPS port; `wg0` is **not** restarted, so
 connected clients stay connected (only `wg-api` restarts, for a second or two).
 
 On each server:
 
 ```bash
-curl -fsSLo install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/v2.1.1/install-wg-full.sh
-echo "555b961d6b544d95f4d7387af82ecff38d90bf8d9b21a10232340798eaa4f3cb  install-wg-full.sh" | sha256sum -c -
+curl -fsSLo install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh
+echo "71ecfb389a70b6c98535096c09f0dcf5f920bd054a3ee9f136a88234e1fb7625  install-wg-full.sh" | sha256sum -c -
 sudo bash install-wg-full.sh --update-api
 ```
 
@@ -139,7 +169,7 @@ What `--update-api` changes:
    `wg0.conf`'s PostUp/PostDown with it (the NAT lines and all `[Peer]` blocks stay; a backup
    `wg0.conf.bak-<date>` is made) and applies the new rules live. Suspensions that existed only
    in iptables are carried over to `/etc/wireguard/suspended.list`.
-2. **API:** rewrites `wg-api-helper` and `server.js` (API 2.1), reinstalls the pinned npm
+2. **API:** rewrites `wg-api-helper` and `server.js` (API 2.3), reinstalls the pinned npm
    packages, makes `/opt/wg-api` owned by root, rewrites `wg-api.service` and restarts it.
 3. **wg-peer-ctrl.sh:** suspensions from the management server now go through the same
    state file, so they survive restarts.
@@ -153,15 +183,15 @@ Check a server after the update:
 
 ```bash
 sudo wg-firewall.sh status | head -12       # FORWARD starts with -j WG-SUSPEND, then WG-GUARD
-curl --insecure --pinnedpubkey "$PIN" "$URL/server" -H "Authorization: Bearer $TOKEN"   # "apiVersion":"2.1"
+curl --insecure --pinnedpubkey "$PIN" "$URL/server" -H "Authorization: Bearer $TOKEN"   # "apiVersion":"2.2"
 ```
 
 Many servers at once, from a machine that can SSH to them as root:
 
 ```bash
 for h in us08.example.com de01.example.com; do
-  ssh root@"$h" 'curl -fsSLo /root/install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/v2.1.1/install-wg-full.sh &&
-    echo "555b961d6b544d95f4d7387af82ecff38d90bf8d9b21a10232340798eaa4f3cb  /root/install-wg-full.sh" | sha256sum -c - &&
+  ssh root@"$h" 'curl -fsSLo /root/install-wg-full.sh https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/refs/heads/main/install-wg-full.sh &&
+    echo "71ecfb389a70b6c98535096c09f0dcf5f920bd054a3ee9f136a88234e1fb7625  /root/install-wg-full.sh" | sha256sum -c - &&
     bash /root/install-wg-full.sh --update-api --yes' || echo "FAILED: $h"
 done
 ```
@@ -175,7 +205,7 @@ All endpoints except `/health` need the header `Authorization: Bearer <apiToken>
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /create` | create a key; returns the client config as text (`?format=json` for JSON). Optional body `{"name":"Ali phone","ipAddress":"10.66.0.2","traffic":"20G"}` |
+| `POST /create` | create a key; returns the client config as text (`?format=json` for JSON). Optional body `{"name":"Ali phone","ipAddress":"10.66.0.2","traffic":"20G","expires":"30d"}` (or `"expiresAfterFirstConnection":"1m"`) |
 | `POST /access-keys` | same as `/create?format=json`, answers `201` (Outline Manager's call) |
 | `GET /keys` (also `GET /`, `GET /access-keys`) | **all keys** with their full settings, ready config, usage, pause and limit state |
 | `GET /keys/<ip>` | one key |
@@ -184,6 +214,8 @@ All endpoints except `/health` need the header `Authorization: Bearer <apiToken>
 | `POST /keys/<ip>/resume` | lift the pause (also `PUT /keys/<ip>/paused {"paused":false}`) |
 | `PUT /keys/<ip>/limit` | set or change the **traffic limit**, body `{"traffic":"50G"}`; `{"traffic":"unlimited"}` removes it |
 | `DELETE /keys/<ip>/limit` | remove the traffic limit (unlimited) |
+| `PUT /keys/<ip>/expiry` | set or change the **time limit**: `{"expires":"30d"}` (from now; also `"12h"`, `"2w"`, `"1m"`, `"1y"`), `{"expiresOn":"2026-12-31 18:00"}` (on that date and time of the **server's clock**), `{"expiresAfterFirstConnection":"1m"}` (from the first connection), `{"expires":"never"}` (none) |
+| `DELETE /keys/<ip>/expiry` | remove the time limit |
 | `POST /remove` | remove a key, body `{"ipAddress":"10.66.0.2"}` (also `DELETE /keys/<ip>`) |
 | `GET /usage` | **all keys**: upload/download bytes, last handshake, plus totals (light, for polling) |
 | `GET /usage/<ip>` | usage of **one key**, e.g. `/usage/10.66.0.2` |
@@ -195,7 +227,7 @@ Every `/keys/<ip>/...` route also exists under `/access-keys/<ip>/...`; Outline'
 `PUT /access-keys/<ip>/data-limit {"limit":{"bytes":N}}` and `DELETE .../data-limit` work as well.
 
 Errors: `401` wrong or missing token, `400` malformed address, an address that is not a client
-address of this server, or a traffic value that is not understood, `404` unknown key,
+address of this server, or a traffic / time value that is not understood, `404` unknown key,
 `409` the requested `ipAddress` is already in use, `503` address pool full.
 
 ### Traffic limits and pausing
@@ -214,7 +246,33 @@ address of this server, or a traffic value that is not understood, `404` unknown
   `/etc/wg-api/policy.db`, and survive restarts and reboots.
 * Each key in `/keys` carries `paused`, `dataLimitBytes` (0 = unlimited), `dataLimit`
   (`{"bytes":N}` or `null`, Outline's shape), `limitReached` and `status`
-  (`active` / `paused` / `limit`).
+  (`active` / `paused` / `limit` / `expired`).
+
+### Time limits
+
+Three kinds, set when the key is created (`POST /create`) or later (`PUT /keys/<ip>/expiry`):
+
+| Body | The key stops working |
+|---|---|
+| `{"expires":"30d"}` | 30 days from now. Units: `h` hours, `d` days, `w` weeks, `m` months, `y` years (`"12 hours"`, `"1 month"`, `"2 weeks"`, `"1 year"` and a plain number of days work too) |
+| `{"expiresOn":"2026-12-31 18:00"}` | **End on:** at that date and time on the **server's clock** (its time zone, see `timeZone` / `serverClock` in `GET /server`). `"2026-12-31"` alone = 23:59:59 that day; `"2026-12-31T18:00"` works; a time with a zone (`"...Z"`, `"...+02:00"`) is honoured. A time already past is refused with 400. `"expires"` takes the same dates |
+| `{"expiresAfterFirstConnection":"1m"}` | one month after the key's **first connection**. Until it connects, there is no end yet. For a key that has already connected, the end is its first connection + 1 month (so it can already be over) |
+| `{"expires":"never"}` or `DELETE /keys/<ip>/expiry` | never (removes the time limit) |
+
+* **`m` is months, not minutes.** Months are calendar months in UTC, kept inside the target month:
+  Jan 15 + 1m = Feb 15, Jan 31 + 1m = Feb 28 (29 in a leap year). A year is 12 such months
+  (`"1y"` is stored and shown as `"12m"` in `expiresAfterFirstConnection`).
+* **Checked every minute**, together with the traffic limits; a new end is applied at once. A key's first
+  connection is recorded on the first check after it connects (so up to a minute late). On a server updated
+  from an older version, keys that had connected before get the last handshake known at the update as their
+  first connection.
+* **An expired key is blocked** like a paused one (`"status":"expired"`, `"expired":true`). Its config,
+  usage and settings stay; giving it a later end, a new duration or none unblocks it. `resume` does not
+  lift an expiry.
+* Each key carries `expiresAt` (ISO time, `null` = no end yet), `expiresAtServer` (the same end on the server's clock, e.g. `"2026-12-31 18:00"`), `expiresAfterFirstConnection` (e.g. `"1m"`
+  while the key waits for its first connection, and after it), `firstConnectedAt` (every key; `null` = never
+  connected) and `expired`.
+* Saved in `/etc/wg-api/policy.db`, enforced in the `WG-SUSPEND` firewall chain; survives restarts and reboots.
 
 A key is identified by its IP address. The default pool is `10.66.0.0/16`: the server is
 `10.66.0.1` and keys are handed out from `10.66.0.2` up to `10.66.255.254`, **65,533 keys** in total.
@@ -241,6 +299,19 @@ curl --insecure --pinnedpubkey "$PIN" -X PUT "$URL/keys/10.66.0.2/limit" -H "Aut
      -H 'Content-Type: application/json' -d '{"traffic":"50G"}'
 curl --insecure --pinnedpubkey "$PIN" -X PUT "$URL/keys/10.66.0.2/limit" -H "Authorization: Bearer $TOKEN" \
      -H 'Content-Type: application/json' -d '{"traffic":"unlimited"}'
+
+# time limit: 30 days from now / on a date and time of the server's clock / 1 month from the first connection / none
+curl --insecure --pinnedpubkey "$PIN" -X PUT "$URL/keys/10.66.0.2/expiry" -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"expires":"30d"}'
+curl --insecure --pinnedpubkey "$PIN" -X PUT "$URL/keys/10.66.0.2/expiry" -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"expiresOn":"2026-12-31 18:00"}'
+curl --insecure --pinnedpubkey "$PIN" -X PUT "$URL/keys/10.66.0.2/expiry" -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"expiresAfterFirstConnection":"1m"}'
+curl --insecure --pinnedpubkey "$PIN" -X DELETE "$URL/keys/10.66.0.2/expiry" -H "Authorization: Bearer $TOKEN"
+
+# a new key: 20 GB for one month, counted from its first connection
+curl --insecure --pinnedpubkey "$PIN" -X POST "$URL/create?format=json" -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"traffic":"20G","expiresAfterFirstConnection":"1m"}'
 
 # pause and resume
 curl --insecure --pinnedpubkey "$PIN" -X POST "$URL/keys/10.66.0.2/pause"  -H "Authorization: Bearer $TOKEN"
@@ -275,8 +346,19 @@ but at the next free address and without a limit.
   Servers installed before this version get it with `sudo ./install-wg-full.sh --update-api`.
 * To collect usage from several servers, keep each server's domain, HTTPS port,
   token and pin (all in its `access.json`) and poll `/usage` on each.
-* "Last seen" (`lastHandshake`) is saved with the usage too, so it no longer shows `never`
-  after a restart for a key that has connected before.
+* "Last seen" (`lastHandshake`) and the first connection (`firstConnectedAt`) are saved with the
+  usage for every key, so they no longer show `never` after a restart for a key that has connected before.
+
+### What is stored per key, and when it is deleted
+
+| File (root only) | What | Deleted |
+|---|---|---|
+| `/var/lib/wg-api/traffic.db` | usage, last handshake, first connection | when the key is removed (API, app, or by hand from `wg0.conf`: on the next minute's check) |
+| `/etc/wg-api/clients.db` | the client's private key (for `GET /keys`), name, created | the same |
+| `/etc/wg-api/policy.db` | pause, traffic limit, time limit | the same |
+
+A new key that later gets the same address starts with zero usage and no handshakes (everything is
+stored per public key, and the old rows are gone).
 
 ---
 
@@ -290,7 +372,7 @@ an ACCEPT rule above the suspensions.
 ```text
 INPUT    -p udp --dport <wg port> -j ACCEPT
 INPUT    -i wg0 -j WG-IN           clients may ping the server and use DNS on it, nothing else
-FORWARD  -j WG-SUSPEND             paused keys, keys over their limit, wg-peer-ctrl suspensions
+FORWARD  -j WG-SUSPEND             paused, over-limit and expired keys, wg-peer-ctrl suspensions
 FORWARD  -i wg0 -j WG-GUARD        no client-to-client; no 10/8, 172.16/12, 192.168/16, 169.254/16 (metadata), 100.64/10 ...
 FORWARD  -i wg0 -j ACCEPT
 FORWARD  -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
@@ -348,8 +430,10 @@ Enforcement actions are logged: `journalctl -t wg-peer-ctrl -f`.
   `ss -ltnp | grep -E 'caddy|node'`.
 * **`curl: (90) SSL: public key does not match pinned public key`**: the pin is from
   an older install, or a placeholder was left in the command. Recompute it (above).
-* **`Cannot GET /usage`**, or `404` on `/keys/<ip>/pause` or `/limit`: the server still runs an
+* **`Cannot GET /usage`**, or `404` on `/keys/<ip>/pause`, `/limit` or `/expiry`: the server still runs an
   older `server.js`; [update it](#updating-installed-servers).
+* **A key expired a month early / late**: `"1m"` is one month, not one minute; and a date without a
+  time means the *end* of that day in UTC.
 * **A key was created without its limit / at another address**: the request had no
   `-H 'Content-Type: application/json'`, so the body was ignored.
 * **A paused or over-limit key still works**: check `sudo wg-firewall.sh status` shows
@@ -357,7 +441,7 @@ Enforcement actions are logged: `journalctl -t wg-peer-ctrl -f`.
   that was never updated, a `wg0` restart moved the old ACCEPT rules above the suspensions;
   run `--update-api`.
 * **`sha256sum: WARNING: 1 computed checksum did NOT match`**: the downloaded file is not the
-  2.1.1 release (wrong tag, or it changed). Do not run it.
+  2.3.0 file (`main` changed since, or the download was altered). Do not run it; use the newer command.
 * **Caddy: `permission denied` on `/var/log/caddy/wg-api.log`**: fixed in the current
   installer; on an old install run `chown -R caddy:caddy /var/log/caddy && systemctl restart caddy`.
 
@@ -587,5 +671,5 @@ both fixed by re-running the installer with `--add-monitor`:
   private keys: share them like passwords.
 * VPN clients are isolated from each other and from private / cloud-metadata networks
   by default (see [Firewall](#firewall)).
-* Install and update from a tagged release with its SHA-256 checked
+* Install and update with the script's SHA-256 checked
   (see [Install](#install)); the health tools are pinned the same way inside the script.
