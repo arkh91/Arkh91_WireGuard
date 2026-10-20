@@ -13,7 +13,8 @@
 #     PUT /access-keys/<ip>/name, GET /server, GET /metrics/transfer,
 #     pause/resume a key (POST /keys/<ip>/pause, /resume) and a traffic limit per key
 #     (PUT /keys/<ip>/limit {"traffic":"20G"} or "unlimited"; also at create time), and a time limit per key
-#     (PUT /keys/<ip>/expiry {"expires":"30d"} from now, or {"expiresAfterFirstConnection":"1m"}).
+#     (PUT /keys/<ip>/expiry {"expires":"30d"} from now, {"expiresOn":"2026-12-31 18:00"} on that date and time of the
+#     server's clock, or {"expiresAfterFirstConnection":"1m"}).
 #     Access config in two formats (Mithra WireGuard Manager takes either):
 #       {"apiUrl":"https://host:port","apiToken":"...","certSha256":"..."}
 #       {"apiUrl":"https://host:port/<secret>","certSha256":"..."}   (exactly Outline's format:
@@ -105,7 +106,7 @@ MONITOR_KEY_FILE=""
 MONITOR_MARK="# wg-monitor (install-wg-full.sh)"
 
 BIN_DIR="/usr/local/bin"
-SCRIPT_VERSION="2.2.2"
+SCRIPT_VERSION="2.3.0"
 # the health tools are fetched from this exact commit and must match these hashes (update both together)
 REPO_RAW="https://raw.githubusercontent.com/arkh91/Arkh91_WireGuard/1764dec2a35b2f054217496e9e3ea929ebb59fe0"
 declare -A TOOL_SHA256=(
@@ -1175,7 +1176,8 @@ step_install_api_helper() {
 #                                       paused (0/1), traffic limit in bytes (0 = unlimited), over the limit (0/1)
 #   wg-api-helper pause <ip>            block all traffic of a key (it stays configured; resume undoes it)
 #   wg-api-helper resume <ip>           lift a pause
-#   wg-api-helper expiry <ip> <spec>    time limit of a key: 0 (none), at:<epoch>, in:<n>h|d|w|m (from now) or
+#   wg-api-helper expiry <ip> <spec>    time limit of a key: 0 (none), at:<epoch>, on:<YYYY-MM-DD HH:MM> (server's local
+#                                       time), in:<n>h|d|w|m (from now) or
 #                                       after:<n>h|d|w|m (from its first connection; m = calendar months). A key past its
 #                                       end is blocked like a paused one until it gets a later end (or none).
 #   wg-api-helper limit <ip> <bytes>    traffic limit of a key, upload + download since it was created; 0 = unlimited.
@@ -1440,14 +1442,37 @@ add_duration() {
     esac
 }
 
-# Usage: valid_expiry <spec>    -> 0 for: 0 (no time limit) | at:<epoch> | in:<duration> | after:<duration>
+# Usage: valid_expiry <spec>    -> 0 for: 0 (no time limit) | at:<epoch> | on:<YYYY-MM-DD HH:MM[:SS]> (the SERVER's local
+#        time) | in:<duration> | after:<duration>
 valid_expiry() {
     case "$1" in
         0) return 0 ;;
         at:*) [[ "${1#at:}" =~ ^[1-9][0-9]{8,10}$ ]] ;;
+        on:*) [[ "${1#on:}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[\ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$ ]] ;;
         in:*) valid_duration "${1#in:}" ;;
         after:*) valid_duration "${1#after:}" ;;
         *) return 1 ;;
+    esac
+}
+
+# Usage: on_epoch <YYYY-MM-DD HH:MM[:SS]> -> prints the epoch of that wall-clock time in the server's time zone (/etc/localtime);
+#        fails for a date that does not exist (2026-02-30, 25:00)
+on_epoch() {
+    local t="${1/T/ }" e back
+    e="$(date -d "$t" +%s 2>/dev/null)" || return 1
+    back="$(date -d "@$e" '+%Y-%m-%d %H:%M' 2>/dev/null)" || return 1
+    [ "$back" = "${t:0:16}" ] || return 1          # date(1) rolled an impossible time over (e.g. DST gap): refuse it
+    printf '%s' "$e"
+}
+
+# Usage: check_expiry <spec>    -> fails (exit with a message) unless the spec is valid; an "on:" time must be in the future
+check_expiry() {
+    local e
+    valid_expiry "$1" || fail "invalid expiry"
+    case "$1" in
+        on:*)
+            e="$(on_epoch "${1#on:}")" || fail "invalid expiry"
+            [ "$e" -gt "$(date +%s)" ] || fail "end time is in the past" ;;
     esac
 }
 
@@ -1499,6 +1524,7 @@ pol_set() {
         -) ;;
         0) ex=0; du="" ;;
         at:*) ex="${exp#at:}"; du="" ;;
+        on:*) ex="$(on_epoch "${exp#on:}")" || fail "invalid expiry"; du="" ;;
         in:*) ex="$(add_duration "$now" "${exp#in:}")"; du="" ;;
         after:*) du="${exp#after:}"; ex=0 ;;      # pol_calc counts from the key's recorded first connection
     esac
@@ -1569,7 +1595,7 @@ cmd_limit() {
 #                                  (from the key's first connection). A key past its end is blocked until it gets a new one.
 cmd_expiry() {
     local pub
-    valid_expiry "$2" || fail "invalid expiry"
+    check_expiry "$2"
     pub="$(key_of "$1")"
     pol_set "$1" "$pub" - - "$2"
     logger -t wg-api-helper "result=OK action=expiry ip=$1 spec=$2"
@@ -1641,7 +1667,7 @@ cmd_add_auto() {
         if grep -Eq "^AllowedIPs[[:space:]]*=[[:space:]]*${want//./\\.}/32[[:space:]]*\$" "$WG_CONF"; then fail "ip already allocated: $want"; fi
     fi
     if [ -n "$limit" ]; then valid_bytes "$limit" || fail "invalid limit"; fi
-    if [ -n "$exp" ]; then valid_expiry "$exp" || fail "invalid expiry"; fi
+    if [ -n "$exp" ]; then check_expiry "$exp"; fi
     if [ ! -t 0 ]; then IFS= read -r priv || true; fi
     if [ -n "$priv" ]; then
         is_valid_pubkey "$priv" || fail "invalid private key"
@@ -1707,7 +1733,7 @@ case "${1:-}" in
     pause)    [ "$#" -eq 2 ] || fail "usage: pause <ip>";         cmd_pause "$2" ;;
     resume)   [ "$#" -eq 2 ] || fail "usage: resume <ip>";        cmd_resume "$2" ;;
     limit)    [ "$#" -eq 3 ] || fail "usage: limit <ip> <bytes>"; cmd_limit "$2" "$3" ;;
-    expiry)   [ "$#" -eq 3 ] || fail "usage: expiry <ip> 0|at:<epoch>|in:<n>h|d|w|m|after:<n>h|d|w|m"; cmd_expiry "$2" "$3" ;;
+    expiry)   [ "$#" -eq 3 ] || fail "usage: expiry <ip> 0|at:<epoch>|on:<YYYY-MM-DD HH:MM>|in:<n>h|d|w|m|after:<n>h|d|w|m"; cmd_expiry "$2" "$3" ;;
     rename)   [ "$#" -eq 3 ] || fail "usage: rename <ip> <name>"; cmd_rename "$2" "$3" ;;
     keys)     [ "$#" -le 2 ] || fail "usage: keys [<ip>]";        cmd_keys "${2:-}" ;;
     remove)   [ "$#" -eq 2 ] || fail "usage: remove <ip>";        cmd_remove "$2" ;;
@@ -1877,9 +1903,9 @@ const CLIENT_DNS = '__DNS__';
 // WG_API_HELPER: test override only; in production sudoers allows nothing but the real path
 const HELPER = process.env.WG_API_HELPER || '/usr/local/bin/wg-api-helper';
 // reported by GET /server; Mithra WireGuard Manager uses it to know which routes exist
-const API_VERSION = '2.2';
+const API_VERSION = '2.3';
 // what this server can do beyond listing/creating/removing keys (the app shows the matching buttons)
-const FEATURES = ['names', 'pause', 'limit', 'createAt', 'expiry'];
+const FEATURES = ['names', 'pause', 'limit', 'createAt', 'expiry', 'expiryOn'];
 const STARTED_MS = Date.now();
 
 // Usage: sameSecret(a, b) -> true if two strings are equal (constant time)
@@ -1967,9 +1993,25 @@ function parseDuration(v) {
     return (+m[1]) + ({ h: 'h', d: 'd', w: 'w', m: 'm' })[m[2][0]];
 }
 
-// Usage: expiryFrom(req) -> the helper's expiry spec ("0", "in:30d", "at:<epoch>", "after:30d"), undefined when the
-//        request sets none, NaN when it is not valid. Body fields:
-//          "expires": "30d" | "1m" | "2026-12-31" (end of that day, UTC) | "2026-12-31T18:00:00Z" | "never"
+// Usage: endOn(text) -> "on:<YYYY-MM-DD HH:MM:SS>" (a wall-clock time in THIS SERVER's time zone) or "at:<epoch>" (the text
+//        carries its own zone: Z or +02:00), NaN when it is not a date. A date alone means the end of that day (23:59:59).
+//        "2026-12-31" | "2026-12-31 18:00" | "2026-12-31T18:00[:30]" | "2026-12-31T18:00:00Z" | "2026-12-31T18:00:00+02:00"
+function endOn(text) {
+    const t = String(text).trim();
+    const m = /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2})(?::(\d{2}))?)?$/.exec(t);
+    if (m) return 'on:' + m[1] + ' ' + (m[2] || '23:59') + ':' + (m[3] || (m[2] ? '00' : '59'));
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(t)) {
+        const sec = Math.floor(Date.parse(t) / 1000);
+        return Number.isFinite(sec) && sec > 1e9 && sec < 1e11 ? 'at:' + sec : NaN;
+    }
+    return NaN;
+}
+
+// Usage: expiryFrom(req) -> the helper's expiry spec ("0", "in:30d", "on:2026-12-31 18:00:00", "at:<epoch>", "after:30d"),
+//        undefined when the request sets none, NaN when it is not valid. Body fields:
+//          "expires": "30d" | "1m" | "never" (or any date below)
+//          "expiresOn": "2026-12-31 18:00" | "2026-12-31" (end of that day) | "never" - the SERVER's clock; a zone in
+//                       the text ("...Z", "...+02:00") is honoured
 //          "expiresAfterFirstConnection": "30d" | "1m"   (the clock starts at the key's first connection)
 function expiryFrom(req) {
     const b = (req.body && typeof req.body === 'object') ? req.body : {};
@@ -1977,19 +2019,34 @@ function expiryFrom(req) {
         const d = parseDuration(b.expiresAfterFirstConnection);
         return d === undefined ? NaN : (d === null ? '0' : 'after:' + d);
     }
+    if ('expiresOn' in b) {
+        const v = b.expiresOn;
+        if (v === null || (typeof v === 'string' && parseDuration(v) === null)) return '0';
+        return typeof v === 'string' ? endOn(v) : NaN;
+    }
     if (!('expires' in b)) return undefined;
     const v = b.expires;
     const d = parseDuration(v);
     if (d === null) return '0';
     if (d !== undefined) return 'in:' + d;
-    if (typeof v !== 'string') return NaN;
-    const t = v.trim();
-    let ms = NaN;
-    const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
-    if (day) ms = Date.UTC(+day[1], +day[2] - 1, +day[3], 23, 59, 59);
-    else if (/^\d{4}-\d{2}-\d{2}T/.test(t)) ms = Date.parse(t);
-    const sec = Math.floor(ms / 1000);
-    return Number.isFinite(sec) && sec > 1e9 && sec < 1e11 ? 'at:' + sec : NaN;
+    return typeof v === 'string' ? endOn(v) : NaN;
+}
+
+// Usage: serverClock(sec) -> "2026-12-31 18:00" for an epoch, in this server's time zone
+function serverClock(sec) {
+    const d = new Date(sec * 1000), p = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+// Usage: serverOffset() -> "+02:00": the server's current offset from UTC
+function serverOffset() {
+    const o = -new Date().getTimezoneOffset(), a = Math.abs(o), p = n => String(n).padStart(2, '0');
+    return (o < 0 ? '-' : '+') + p(Math.floor(a / 60)) + ':' + p(a % 60);
+}
+
+// Usage: serverNow() -> "2026-10-19 17:31 (UTC-07:00)"
+function serverNow() {
+    return serverClock(Date.now() / 1000) + ' (UTC' + serverOffset() + ')';
 }
 
 // Usage: keyObject({ip, publicKey, privateKey, created, rx, tx, hs, paused, limit, over}) -> one key as returned by
@@ -2019,6 +2076,7 @@ function keyObject(k) {
         dataLimit: limit ? { bytes: limit } : null,         // Outline's shape
         limitReached: !!(limit && k.over),
         expiresAt: k.exp ? new Date(k.exp * 1000).toISOString() : null,                  // null = no end (yet)
+        expiresAtServer: k.exp ? serverClock(k.exp) : null,                             // the same moment on the server's clock
         expiresAfterFirstConnection: k.dur || null,                                      // e.g. "30d", "1m"
         firstConnectedAt: k.first ? new Date(k.first * 1000).toISOString() : null,
         expired: !!k.expd,
@@ -2053,6 +2111,7 @@ function helperFailure(err, fallback) {
     if (/ip already allocated/.test(msg)) return { status: 409, error: 'ip already in use' };
     if (/invalid limit/.test(msg)) return { status: 400, error: 'invalid traffic limit' };
     if (/invalid expiry/.test(msg)) return { status: 400, error: 'invalid time limit' };
+    if (/end time is in the past/.test(msg)) return { status: 400, error: 'the end time is in the past (server time: ' + serverNow() + ')' };
     return { status: 500, error: fallback };
 }
 
@@ -2105,12 +2164,12 @@ function createKey(name, ip, limit, expiry) {
         : keyObject({ ip: clientIP, publicKey, privateKey, name, created: Math.floor(Date.now() / 1000), limit: limit || 0 });
 }
 
-const EXPIRY_HELP = 'invalid time limit: use "expires": "30d", "1m", "1y", "12h", "2026-12-31" or "never", ' +
-    'or "expiresAfterFirstConnection": "30d" (units h, d, w, m = months, y = years)';
+const EXPIRY_HELP = 'invalid time limit: use "expires": "30d", "1m", "1y", "12h" or "never", ' +
+    '"expiresOn": "2026-12-31 18:00" (server time), or "expiresAfterFirstConnection": "30d" (units h, d, w, m = months, y = years)';
 
 // Usage: createRequest(req) -> { name, ip, limit, expiry } from the body / query, or { error } (400)
 //        {"name": "...", "ipAddress": "10.66.0.2", "traffic": "20G", "expires": "30d"} - every field optional
-//        (or "expiresAfterFirstConnection": "1m" instead of "expires")
+//        (or "expiresOn": "2026-12-31 18:00" / "expiresAfterFirstConnection": "1m" instead of "expires")
 function createRequest(req) {
     const b = (req.body && typeof req.body === 'object') ? req.body : {};
     const name = cleanName(b.name || req.query.name);
@@ -2228,7 +2287,9 @@ app.get('/usage/:ip', (req, res) => {
 
 // Usage: serverInfo() -> the public facts about this server (no secrets)
 function serverInfo() {
-    return { publicKey: SERVER_PUB, endpoint: ENDPOINT + ':' + WG_PORT, dns: CLIENT_DNS, apiVersion: API_VERSION, features: FEATURES };
+    return { publicKey: SERVER_PUB, endpoint: ENDPOINT + ':' + WG_PORT, dns: CLIENT_DNS, apiVersion: API_VERSION, features: FEATURES,
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, utcOffset: serverOffset(),
+        serverTime: new Date().toISOString(), serverClock: serverClock(Date.now() / 1000) };
 }
 
 // Usage: listKeys(field) -> express handler answering { server, timestamp, count, totals, <field>: [ keyObject ] }
@@ -2354,7 +2415,9 @@ app.put(['/keys/:ip/limit', '/access-keys/:ip/limit', '/access-keys/:ip/data-lim
 app.delete(['/keys/:ip/limit', '/access-keys/:ip/limit', '/access-keys/:ip/data-limit'], (req, res) => keyAction(res, req.params.ip, ['limit', '0']));
 
 // PUT /keys/:ip/expiry {"expires": "30d"}                       -> ends 30 days from now ("1m" = one calendar month,
-//                                                                   "2026-12-31" = end of that day UTC, "never" = no end)
+//                                                                   "never" = no end)
+// PUT /keys/:ip/expiry {"expiresOn": "2026-12-31 18:00"}        -> ends at that time on the SERVER's clock (GET /server shows
+//                                                                   it: serverClock, timeZone); a date alone = end of that day
 // PUT /keys/:ip/expiry {"expiresAfterFirstConnection": "30d"}   -> ends 30 days after the key's first connection
 //                                                                   (now, if it has connected before)
 // DELETE /keys/:ip/expiry                                        -> no time limit
@@ -2605,7 +2668,7 @@ update_api() {
             chmod 600 "$ACCESS_OUTLINE_FILE"
         fi
     fi
-    ok "wg-api updated (API 2.2): pause/resume, traffic and time limits, create at a chosen address, IPv6 kept in the tunnel"
+    ok "wg-api updated (API 2.3): pause/resume, traffic and time limits (incl. an end date/time in server time), create at a chosen address, IPv6 kept in the tunnel"
     echo "  Client configs now use AllowedIPs = 0.0.0.0/0, ::/0. Devices that imported a key before this update"
     echo "  keep the old config: re-import it (QR / .conf in the app) to stop IPv6 leaking around the tunnel."
     echo
@@ -2802,7 +2865,7 @@ print_success_message() {
         echo "      -H 'Content-Type: application/json' -d '{\"traffic\":\"50G\"}'      # or {\"traffic\":\"unlimited\"}"
         echo "  Time limit: 30 days from now, or 1 month from the key's first connection (\"never\" removes it):"
         echo "    curl ${tlsopts}-X PUT ${API_URL}/keys/$(sample_ip)/expiry -H \"Authorization: Bearer ${API_TOKEN}\" \\"
-        echo "      -H 'Content-Type: application/json' -d '{\"expires\":\"30d\"}'      # or {\"expiresAfterFirstConnection\":\"1m\"}"
+        echo "      -H 'Content-Type: application/json' -d '{\"expires\":\"30d\"}'      # or {\"expiresOn\":\"2026-12-31 18:00\"} (server time) / {\"expiresAfterFirstConnection\":\"1m\"}"
         echo "  Pause / resume a key:"
         echo "    curl ${tlsopts}-X POST ${API_URL}/keys/$(sample_ip)/pause -H \"Authorization: Bearer ${API_TOKEN}\"     # .../resume"
         echo
@@ -2860,7 +2923,6 @@ install_all() {
     step_install_firewall
     step_start_wireguard
     step_install_peer_ctrl
-    step_create_api_user
     step_install_monitor
     step_install_api_helper
     step_install_traffic_saver
